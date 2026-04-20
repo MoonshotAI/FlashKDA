@@ -1,0 +1,10 @@
+build/**
+.cache/**
+*.egg-info/**
+*.so
+*.ncu-rep
+*.nsys-rep
+.vscode/**
+**/__pycache__/**
+.clangd
+plot*.png
