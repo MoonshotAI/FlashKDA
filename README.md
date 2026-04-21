@@ -48,7 +48,7 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 | `v` | bf16 | `[B, T, H, V]` | Value |
 | `g` | bf16 | `[B, T, H, K]` | Gate before activation |
 | `beta` | bf16 | `[B, T, H]` | Beta logits (pre-activation; sigmoid applied internally) |
-| `scale` | fp32 | scalar | scaling factor |
+| `scale` | float | scalar | scaling factor |
 | `out` | bf16 | `[B, T, H, V]` | Output tensor |
 | `A_log` | fp32 | `[H]` | Log-gate parameter |
 | `dt_bias` | fp32 | `[H, K]` | Gate bias |
