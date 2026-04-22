@@ -2,6 +2,10 @@
 
 FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on CUTLASS
 
+## News
+
+- **2026-04-22** — Deep-Dive Blog: the design decisions behind FlashKDA v1, read it [here](docs/20260420-flashkda-v1-deep-dive.md).
+
 ## Requirements
 - SM90 and above
 - CUDA 12.9 and above
@@ -15,7 +19,41 @@ git submodule update --init --recursive
 pip install -v .
 ```
 
-Once installed, FlashKDA can be used directly as a backend of `flash-linear-attention`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.
+## Using FlashKDA as an FLA backend
+
+Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chunk_kda`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.
+
+**Requirements**
+
+1. Install `flash-linear-attention >= 0.5.0`:
+   ```bash
+   pip install -U flash-linear-attention
+   ```
+2. Call `chunk_kda` under `torch.inference_mode()` 
+   ```python
+   import torch
+   from fla.ops.kda import chunk_kda
+
+   with torch.inference_mode():
+       out, final_state = chunk_kda(
+           q=q, k=k, v=v, g=g, beta=beta,
+           scale=scale,
+           initial_state=h0,
+           output_final_state=True,
+           use_gate_in_kernel=True,
+           use_qk_l2norm_in_kernel=True,
+           use_beta_sigmoid_in_kernel=True,
+           safe_gate=True,
+           A_log=A_log, dt_bias=dt_bias,
+           lower_bound=lower_bound,
+           transpose_state_layout=True,
+           cu_seqlens=cu_seqlens,
+       )
+   ```
+
+**Opt out:** set `FLA_FLASH_KDA=0` to fall back to the Triton path.
+
+**Debug dispatch:** add `logging.basicConfig(level=logging.INFO)` to see `[FLA Backend] kda.chunk_kda -> flashkda` on hit, or `... rejected: <reason>` on miss.
 
 ## Performance
 
