@@ -103,19 +103,19 @@ def run_fla_gold_reference(q, k, v, g, beta, h0, A_log, dt_bias, scale, lower_bo
     tri = tri.to(torch.float32)
     tri_ht = tri_ht.to(torch.float32)
 
-    # chunk_kda with use_beta_sigmoid_in_kernel=True accepts logit beta
+    # upstream hasn't implemented use_beta_sigmoid_in_kernel; pass post-sigmoid beta explicitly.
+    beta_activated = torch.sigmoid(beta.clone().float()).to(torch.bfloat16)
     chunk_o, chunk_ht = chunk_kda(
         q=q.clone().to(torch.bfloat16),
         k=k.clone().to(torch.bfloat16),
         v=v.clone(),
         g=g.clone(),
-        beta=beta.clone(),
+        beta=beta_activated,
         scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
         use_gate_in_kernel=True,
         use_qk_l2norm_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
         A_log=A_log.clone(),
         dt_bias=dt_bias.clone(),
         lower_bound=lower_bound,
