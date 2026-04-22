@@ -17,6 +17,7 @@ def get_nvcc_thread_args():
 
 
 def get_arch_flags():
+    # TODO: add compile flags here to support more architectures
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
     DISABLE_SM90 = is_flag_set("FLASH_KDA_DISABLE_SM90")
     arch_flags = []
