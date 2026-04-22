@@ -3,6 +3,7 @@ import flash_kda
 import torch.nn.functional as F
 import math
 from fla.ops.kda import chunk_kda
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 def bench_fn(fn, warmup, iters, repeats):
     for _ in range(max(warmup, 1)):
@@ -111,6 +112,24 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
 
     mean, mn, mx = bench_fn(run_chunk_kda, warmup, iters, repeats)
     print(f"  chunk_kda : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
+
+    # --- chunk_gated_delta_rule (FLA GDN, scalar per-head gate) ---
+    g_gdn = torch.randn((1, T_total, H), dtype=torch.float32, device=device)
+    h0_gdn = initial_state.float()
+
+    def run_chunk_gated_delta_rule():
+        chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g_gdn, beta=beta,
+            scale=scale_float,
+            initial_state=h0_gdn,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            transpose_state_layout=True,
+            **extra,
+        )
+
+    mean, mn, mx = bench_fn(run_chunk_gated_delta_rule, warmup, iters, repeats)
+    print(f"  chunk_gated_delta_rule : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
 
 
 FIXED_CASES = [

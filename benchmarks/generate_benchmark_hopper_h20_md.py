@@ -27,6 +27,11 @@ FLA_CHUNK_KDA_OPTIONS_MD = (
     "`use_qk_l2norm_in_kernel=True`, `use_beta_sigmoid_in_kernel=True`, "
     "`lower_bound=-5`, `transpose_state_layout=True`"
 )
+FLA_CHUNK_GDN_OPTIONS_MD = (
+    "- `fla_chunk_gated_delta_rule` configuration: scalar per-head gate "
+    "`g` of shape `(1, T, H)`, `use_qk_l2norm_in_kernel=True`, "
+    "`transpose_state_layout=True`"
+)
 
 RE_HEADER_FIXED = re.compile(
     r"^shape=\[(\d+),(\d+),(\d+)\] warmup=(\d+) iters=(\d+) repeats=(\d+)\s*$"
@@ -85,6 +90,7 @@ def parse_stdout(text: str) -> list[dict]:
             "repeats": repeats,
             "flash_mean_ms": None,
             "chunk_mean_ms": None,
+            "gdn_mean_ms": None,
         }
         if seq_lens is not None:
             c["seq_lens"] = seq_lens
@@ -132,6 +138,8 @@ def parse_stdout(text: str) -> list[dict]:
                 current["flash_mean_ms"] = float(mean)
             elif name == "chunk_kda":
                 current["chunk_mean_ms"] = float(mean)
+            elif name == "chunk_gated_delta_rule":
+                current["gdn_mean_ms"] = float(mean)
 
     if current is not None:
         cases.append(current)
@@ -197,22 +205,30 @@ def _complete_cases(raw: list[dict]) -> list[dict]:
     return [
         c
         for c in raw
-        if c.get("flash_mean_ms") is not None and c.get("chunk_mean_ms") is not None
+        if c.get("flash_mean_ms") is not None
+        and c.get("chunk_mean_ms") is not None
+        and c.get("gdn_mean_ms") is not None
     ]
 
 
 def _render_table_block(cases: list[dict]) -> list[str]:
     lines: list[str] = [
-        "| Case | `flash_kda` mean (ms) | `fla_chunk_kda` mean (ms) | Speedup |",
-        "|------|----------------------:|----------------------:|--------:|",
+        "| Case | `flash_kda` mean (ms) | `fla_chunk_kda` mean (ms) | "
+        "Speedup vs `chunk_kda` | `fla_chunk_gdn` mean (ms) | "
+        "Speedup vs `gdn` |",
+        "|------|----------------------:|----------------------:|--------:|"
+        "----------------------:|--------:|",
     ]
     for c in cases:
         flash = c["flash_mean_ms"]
         chunk = c["chunk_mean_ms"]
+        gdn = c["gdn_mean_ms"]
         cell = _case_detail(c).replace("|", "\\|")
         lines.append(
             f"| {cell} | {_fmt_ms(flash)} | {_fmt_ms(chunk)} |"
             f" {_fmt_speedup(flash, chunk)} |"
+            f" {_fmt_ms(gdn)} |"
+            f" {_fmt_speedup(flash, gdn)} |"
         )
     lines.append("")
     return lines
@@ -250,6 +266,7 @@ def render_markdown(
         )
         lines.append("")
         lines.append(FLA_CHUNK_KDA_OPTIONS_MD)
+        lines.append(FLA_CHUNK_GDN_OPTIONS_MD)
         lines.append("")
 
     for cases in sections:
@@ -294,7 +311,8 @@ def main() -> None:
     if not cases_a or not cases_b:
         sys.stderr.write(
             "Warning: missing complete benchmark rows for one or both runs "
-            "(need fp32 state and fla_chunk_kda for each).\n"
+            "(need fp32 state, fla_chunk_kda, and fla_chunk_gated_delta_rule "
+            "for each).\n"
         )
 
     generated = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
