@@ -16,8 +16,16 @@ FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on C
 git clone https://github.com/MoonshotAI/FlashKDA.git flash-kda
 cd flash-kda
 git submodule update --init --recursive
-pip install -v .
+pip install -v --no-build-isolation .
 ```
+
+By default, the build detects the current CUDA device and compiles for that architecture. For wheel or CI builds, compile all supported architectures explicitly:
+
+```bash
+FLASH_KDA_CUDA_ARCHS=all pip install -v --no-build-isolation .
+```
+
+Supported values are `auto` (default), `all`, or a comma-separated arch list such as `90a,100a`.
 
 ## Using FlashKDA as an FLA backend
 

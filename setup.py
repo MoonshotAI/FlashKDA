@@ -16,14 +16,40 @@ def get_nvcc_thread_args():
     return ["--threads", nvcc_threads]
 
 
+SUPPORTED_CUDA_ARCHS = ["90a", "100a", "103a", "120a"]
+
+
+def detect_cuda_arch():
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return f"{major}{minor}a"
+
+
 def get_arch_flags():
-    # TODO: add compile flags here to support more architectures
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
-    DISABLE_SM90 = is_flag_set("FLASH_KDA_DISABLE_SM90")
-    arch_flags = []
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
-    return arch_flags
+
+    requested = os.getenv("FLASH_KDA_CUDA_ARCHS", "auto").lower()
+    if requested == "auto":
+        arch = detect_cuda_arch()
+        if arch is None:
+            raise RuntimeError(
+                "FLASH_KDA_CUDA_ARCHS=auto requires a visible CUDA device. "
+                "Set FLASH_KDA_CUDA_ARCHS=all to build all supported archs."
+            )
+        archs = [arch]
+    elif requested == "all":
+        archs = SUPPORTED_CUDA_ARCHS
+    else:
+        archs = [arch.strip() for arch in requested.split(",") if arch.strip()]
+
+    flags = []
+    for arch in archs:
+        flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+    return flags
 
 
 ext_modules = [
