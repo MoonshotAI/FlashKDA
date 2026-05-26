@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Run ``bench_fwd.py`` twice (default ``H`` and ``--H 64``), parse stdout, and write
-``BENCHMARK_H20.md`` at repo root.
+a benchmark markdown report.
 
 Reports mean latency for ``flash_kda (fp32 state)`` and ``fla_chunk_kda`` (FLA
 ``chunk_kda``), plus speedup ``chunk_mean / flash_mean``. Generated date is UTC,
@@ -20,6 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BENCH_FWD = Path(__file__).resolve().parent / "bench_fwd.py"
 DEFAULT_OUT = REPO_ROOT / "BENCHMARK_H20.md"
+DEFAULT_DEVICE_LABEL = "Hopper / H20"
 
 # Matches ``chunk_kda(...)`` in ``benchmarks/bench_fwd.py`` (documented in the report).
 FLA_CHUNK_KDA_OPTIONS_MD = (
@@ -238,13 +239,19 @@ def render_markdown(
     sections: list[list[dict]],
     generated_at: str,
     generator_cmd: str,
+    device_label: str,
 ) -> str:
     """
     *sections*: one ``cases`` list per table (default ``H``, then ``H=64``).
-    *generator_cmd*: command that reproduces this report (``generate_benchmark_hopper_h20_md.py``).
+    *generator_cmd*: command that reproduces this report.
+    *device_label*: device/platform label printed in the report title.
     """
+    title = "# KDA forward benchmark"
+    if device_label:
+        title += f" ({device_label})"
+
     lines: list[str] = [
-        "# KDA forward benchmark (Hopper / H20)",
+        title,
         "",
         f"- Generated: {generated_at}",
         "",
@@ -282,7 +289,7 @@ def render_markdown(
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Run bench_fwd.py and write BENCHMARK_H20.md at repository root."
+        description="Run bench_fwd.py and write a benchmark markdown report."
     )
     p.add_argument(
         "-o",
@@ -291,12 +298,21 @@ def main() -> None:
         default=DEFAULT_OUT,
         help=f"Output markdown path (default: {DEFAULT_OUT})",
     )
+    p.add_argument(
+        "--device-label",
+        default=DEFAULT_DEVICE_LABEL,
+        help=f"Device/platform label for the report title (default: {DEFAULT_DEVICE_LABEL!r})",
+    )
     args, bench_extra = p.parse_known_args()
 
     def _fmt_generator_cmd(extra: list[str]) -> str:
+        cmd = "python benchmarks/generate_benchmark_md.py"
+        if args.output != DEFAULT_OUT:
+            cmd += f" -o {args.output}"
+        if args.device_label != DEFAULT_DEVICE_LABEL:
+            cmd += f" --device-label {args.device_label}"
         tail = " ".join(extra)
-        base = "python benchmarks/generate_benchmark_hopper_h20_md.py"
-        return f"{base} {tail}".strip() if tail else base
+        return f"{cmd} {tail}".strip() if tail else cmd
 
     argv_default = list(bench_extra)
     argv_h64 = _argv_with_h(bench_extra, 64)
@@ -316,7 +332,7 @@ def main() -> None:
         )
 
     generated = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
-    md = render_markdown(sections, generated, _fmt_generator_cmd(bench_extra))
+    md = render_markdown(sections, generated, _fmt_generator_cmd(bench_extra), args.device_label)
     out_path = args.output.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(md, encoding="utf-8")
