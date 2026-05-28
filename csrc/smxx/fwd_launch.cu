@@ -3,7 +3,7 @@
 #include "fwd_kernel2.cuh"
 
 // ==================== launch_fwd ====================
-template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
+template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool USE_LOWER_BOUND, bool IsVarlen>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
@@ -154,7 +154,7 @@ void launch_fwd(
             decltype(tma_load_g), decltype(tma_load_dt_bias),
             decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr),
             decltype(tma_store_ws_gt), decltype(tma_store_ws_inv), decltype(tma_store_ws_mqk),
-            CHUNK, D, kK1Threads, IsVarlen
+            CHUNK, D, kK1Threads, USE_LOWER_BOUND, IsVarlen
         >;
 
         cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1);
@@ -210,22 +210,24 @@ void launch_fwd(
 }
 
 // Explicit instantiations
-#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL) \
-    template void launch_fwd<D, HI, HO, FP32, VL>( \
+#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, LB, VL) \
+    template void launch_fwd<D, HI, HO, FP32, LB, VL>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
         cutlass::bfloat16_t*, void*, int, int, int, int, \
         int64_t const*, float const*, float const*, float, cudaStream_t);
 
-#define INSTANTIATE_STATE_VARIANTS(VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  VL)
+#define INSTANTIATE_STATE_VARIANTS_LOWER_BOUND(VL, LB) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, false, false, LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  LB, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  LB, VL)
 
-INSTANTIATE_STATE_VARIANTS(true)   // varlen
-INSTANTIATE_STATE_VARIANTS(false)  // non-varlen
+INSTANTIATE_STATE_VARIANTS_LOWER_BOUND(true, false)   // varlen, no lower_bound
+INSTANTIATE_STATE_VARIANTS_LOWER_BOUND(true, true)    // varlen, lower_bound
+INSTANTIATE_STATE_VARIANTS_LOWER_BOUND(false, false)  // non-varlen, no lower_bound
+INSTANTIATE_STATE_VARIANTS_LOWER_BOUND(false, true)   // non-varlen, lower_bound

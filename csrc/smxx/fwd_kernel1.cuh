@@ -94,6 +94,7 @@ template <
     int CHUNK,
     int D,
     int NumThreads,
+    bool USE_LOWER_BOUND = false,
     bool IsVarlen = true
 >
 __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
@@ -300,8 +301,13 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 float g_val;
                 if (row < actual_len) {
                     g_val = bf16_to_f32(g_bf16_smem[row * D + col]) + dt;
-                    g_val = a_log_exp * g_val;
-                    g_val = gate_scale * sigmoid_tanh_approx_f32(g_val);
+                    if constexpr (USE_LOWER_BOUND) {
+                        g_val = a_log_exp * g_val;
+                        g_val = gate_scale * sigmoid_tanh_approx_f32(g_val);
+                    } else {
+                        g_val = g_val > 20.0f ? g_val : __logf(1.0f + __expf(g_val));
+                        g_val *= -a_log_exp * 1.4426950408889634f;
+                    }
                 } else {
                     g_val = 0.0f;
                 }

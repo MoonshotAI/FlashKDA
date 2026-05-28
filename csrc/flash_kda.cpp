@@ -33,7 +33,7 @@ void fwd(
     torch::Tensor workspace,
     torch::Tensor A_log,
     torch::Tensor dt_bias,
-    double lower_bound,
+    std::optional<double> lower_bound,
     std::optional<torch::Tensor> initial_state = std::nullopt,
     std::optional<torch::Tensor> final_state = std::nullopt,
     std::optional<torch::Tensor> cu_seqlens = std::nullopt
@@ -122,7 +122,8 @@ void fwd(
     auto out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(out_3d.data_ptr<at::BFloat16>());
     auto A_log_ptr = A_log.data_ptr<float>();
     auto dt_bias_ptr = dt_bias.data_ptr<float>();
-    float gate_scale = float(lower_bound * 1.4426950408889634);
+    bool use_lower_bound = lower_bound.has_value();
+    float gate_scale = float(lower_bound.value_or(0.0) * 1.4426950408889634);
 
     // Transpose beta: [T_total, H] -> [H, T_total] (1D TMA, no T alignment constraint)
     auto beta_t = beta_2d.t().contiguous();
@@ -178,35 +179,39 @@ void fwd(
     }
 
     // Dispatch based on state configuration and varlen
-    #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
+    #define LAUNCH(HI, HO, FP32, LB, VL) \
+        launch_fwd<128, HI, HO, FP32, LB, VL>( \
             q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
             initial_state_raw, scale_f, final_state_raw, out_ptr, \
             workspace_ptr, total_tiles, \
             int(T_total), int(H), int(N_val), cu_seqlens_dev, \
             A_log_ptr, dt_bias_ptr, gate_scale, stream)
 
-    #define DISPATCH_STATE(VL) \
+    #define DISPATCH_STATE(LB, VL) \
         if (!has_state_in && !has_state_out) { \
-            LAUNCH(false, false, false, VL); \
+            LAUNCH(false, false, false, LB, VL); \
         } else if (has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(true, true, true, VL); \
+            LAUNCH(true, true, true, LB, VL); \
         } else if (has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(true, true, false, VL); \
+            LAUNCH(true, true, false, LB, VL); \
         } else if (!has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(false, true, true, VL); \
+            LAUNCH(false, true, true, LB, VL); \
         } else if (!has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(false, true, false, VL); \
+            LAUNCH(false, true, false, LB, VL); \
         } else if (has_state_in && !has_state_out && state_fp32) { \
-            LAUNCH(true, false, true, VL); \
+            LAUNCH(true, false, true, LB, VL); \
         } else { \
-            LAUNCH(true, false, false, VL); \
+            LAUNCH(true, false, false, LB, VL); \
         }
 
-    if (is_varlen) {
-        DISPATCH_STATE(true);
+    if (is_varlen && use_lower_bound) {
+        DISPATCH_STATE(true, true);
+    } else if (is_varlen) {
+        DISPATCH_STATE(false, true);
+    } else if (use_lower_bound) {
+        DISPATCH_STATE(true, false);
     } else {
-        DISPATCH_STATE(false);
+        DISPATCH_STATE(false, false);
     }
 
     #undef DISPATCH_STATE
