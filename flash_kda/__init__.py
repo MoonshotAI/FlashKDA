@@ -39,3 +39,11 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+
+
+def fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+           initial_state=None, final_state=None, cu_seqlens=None, auto_cp=True):
+    """FlashKDA forward with intra-card context parallelism. See flash_kda.cp for details."""
+    from flash_kda.cp import fwd_cp as _fwd_cp
+    return _fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+                   initial_state, final_state, cu_seqlens, auto_cp)
