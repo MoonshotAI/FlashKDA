@@ -2,6 +2,13 @@
 #include <c10/cuda/CUDAStream.h>
 #include "fwd.h"
 
+// Declared in warmup_chunks.cu
+void get_warmup_chunks_cuda(
+    torch::Tensor g, torch::Tensor A_log, torch::Tensor dt_bias,
+    double lower_bound, torch::Tensor cu_seqlens,
+    int chunk_size, double threshold,
+    torch::Tensor num_warmup, torch::Tensor fallback);
+
 int64_t get_workspace_size(
     int64_t T_total,
     int64_t H,
@@ -213,6 +220,134 @@ void fwd(
     #undef LAUNCH
 }
 
+void state_only(
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    double lower_bound,
+    torch::Tensor final_state,
+    std::optional<torch::Tensor> mt_out,
+    torch::Tensor cu_seqlens,
+    torch::Tensor num_warmup_chunks
+) {
+    TORCH_CHECK(k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda(),
+                "all tensors must be on CUDA");
+    TORCH_CHECK(k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous(),
+                "all tensors must be contiguous");
+    TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
+    TORCH_CHECK(v.dtype() == torch::kBFloat16, "v must be bfloat16");
+    TORCH_CHECK(g.dtype() == torch::kBFloat16, "g must be bfloat16");
+    TORCH_CHECK(beta.dtype() == torch::kBFloat16, "beta must be bfloat16");
+
+    TORCH_CHECK(A_log.is_cuda() && A_log.is_contiguous(), "A_log must be contiguous CUDA");
+    TORCH_CHECK(A_log.dtype() == torch::kFloat32, "A_log must be float32");
+    TORCH_CHECK(dt_bias.is_cuda() && dt_bias.is_contiguous(), "dt_bias must be contiguous CUDA");
+    TORCH_CHECK(dt_bias.dtype() == torch::kFloat32, "dt_bias must be float32");
+
+    TORCH_CHECK(final_state.is_cuda() && final_state.is_contiguous(), "final_state must be contiguous CUDA");
+    TORCH_CHECK(final_state.dtype() == torch::kFloat32, "final_state must be float32");
+
+    bool has_mt = mt_out.has_value();
+    if (has_mt) {
+        auto& mt = mt_out.value();
+        TORCH_CHECK(mt.is_cuda() && mt.is_contiguous(), "mt must be contiguous CUDA");
+        TORCH_CHECK(mt.dtype() == torch::kFloat32, "mt must be float32");
+    }
+
+    TORCH_CHECK(cu_seqlens.is_cuda() && cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous CUDA");
+    TORCH_CHECK(cu_seqlens.dtype() == torch::kLong, "cu_seqlens must be int64");
+
+    TORCH_CHECK(num_warmup_chunks.is_cuda() && num_warmup_chunks.is_contiguous(),
+                "num_warmup_chunks must be contiguous CUDA");
+    TORCH_CHECK(num_warmup_chunks.dtype() == torch::kInt32, "num_warmup_chunks must be int32");
+
+    TORCH_CHECK(k.dim() == 4, "k must be [B, T, H, D]");
+    int64_t B = k.size(0);
+    TORCH_CHECK(B == 1, "state_only requires B=1 (varlen mode)");
+    int64_t T_seq = k.size(1);
+    int64_t H = k.size(2);
+    int64_t D = k.size(3);
+    TORCH_CHECK(D == 128, "currently only supports D == 128");
+    int64_t T_total = B * T_seq;
+
+    int64_t N = cu_seqlens.numel() - 1;
+    TORCH_CHECK(N > 0, "cu_seqlens must have at least 2 elements");
+    TORCH_CHECK(num_warmup_chunks.numel() == N, "num_warmup_chunks must have N elements");
+
+    TORCH_CHECK(final_state.dim() == 4, "final_state must be [N, H, D, D]");
+    TORCH_CHECK(final_state.size(0) == N && final_state.size(1) == H &&
+                final_state.size(2) == D && final_state.size(3) == D,
+                "final_state must be [N, H, D, D]");
+    if (has_mt) {
+        auto& mt = mt_out.value();
+        TORCH_CHECK(mt.dim() == 4, "mt must be [N, H, D, D]");
+        TORCH_CHECK(mt.size(0) == N && mt.size(1) == H &&
+                    mt.size(2) == D && mt.size(3) == D,
+                    "mt must be [N, H, D, D]");
+    }
+
+    constexpr int CHUNK = 16;
+    int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+
+    // Allocate workspace for kernel1
+    int64_t ws_bytes = get_workspace_size(T_total, H, N);
+    auto workspace = torch::empty({ws_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(k.device()));
+
+    // Transpose beta: [T_total, H] -> [H, T_total]
+    auto beta_2d = beta.reshape({T_total, H});
+    auto beta_t = beta_2d.t().contiguous();
+
+    auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k.reshape({T_total, H, D}).data_ptr<at::BFloat16>());
+    auto v_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(v.reshape({T_total, H, D}).data_ptr<at::BFloat16>());
+    auto g_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(g.reshape({T_total, H, D}).data_ptr<at::BFloat16>());
+    auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.data_ptr<at::BFloat16>());
+    auto A_log_ptr = A_log.data_ptr<float>();
+    auto dt_bias_ptr = dt_bias.data_ptr<float>();
+    float gate_scale = float(lower_bound * 1.4426950408889634);
+
+    auto workspace_ptr = workspace.data_ptr();
+    auto final_state_ptr = final_state.data_ptr<float>();
+    auto cu_seqlens_ptr = cu_seqlens.data_ptr<int64_t>();
+    auto warmup_ptr = num_warmup_chunks.data_ptr<int32_t>();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // kernel1 needs q to compute q_decayed, but state_only doesn't use it.
+    // Pass k as dummy q — q_decayed/Mqk workspace entries are unused.
+    auto q_ptr = k_ptr;
+    float scale = 1.0f;  // dummy, not used by state_only kernel
+
+    // Run kernel1 with warmup-only optimization (non-warmup tiles early-exit)
+    launch_kernel1_warmup_only<128>(
+        q_ptr, k_ptr, g_ptr, beta_t_ptr,
+        scale, workspace_ptr, int(total_tiles),
+        int(T_total), int(H), int(N), cu_seqlens_ptr,
+        A_log_ptr, dt_bias_ptr, gate_scale, warmup_ptr, stream
+    );
+
+    // Run state_only kernel (computes ht from h0=0)
+    launch_state_only<128>(
+        v_ptr, beta_t_ptr,
+        workspace_ptr, final_state_ptr,
+        int(total_tiles), int(T_total), int(H), int(N),
+        cu_seqlens_ptr, warmup_ptr, stream
+    );
+
+    // Run mt kernel if requested (computes transition matrix)
+    if (has_mt) {
+        auto mt_ptr = mt_out.value().data_ptr<float>();
+        launch_mt_only<128>(
+            v_ptr, beta_t_ptr,
+            workspace_ptr, mt_ptr,
+            int(total_tiles), int(T_total), int(H), int(N),
+            cu_seqlens_ptr, warmup_ptr, stream
+        );
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fwd", &fwd, "FlashKDA Forward (CUDA)",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
@@ -226,4 +361,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Get workspace size in bytes",
         py::arg("T_total"), py::arg("H"),
         py::arg("N") = 1);
+    m.def("state_only", &state_only, "FlashKDA State-Only (CUDA)",
+        py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
+        py::arg("A_log"), py::arg("dt_bias"), py::arg("lower_bound"),
+        py::arg("final_state"), py::arg("mt") = py::none(),
+        py::arg("cu_seqlens"), py::arg("num_warmup_chunks"));
+    m.def("get_warmup_chunks", &get_warmup_chunks_cuda, "Get warmup chunks (CUDA)",
+        py::arg("g"), py::arg("A_log"), py::arg("dt_bias"),
+        py::arg("lower_bound"), py::arg("cu_seqlens"),
+        py::arg("chunk_size"), py::arg("threshold"),
+        py::arg("num_warmup"), py::arg("fallback"));
 }

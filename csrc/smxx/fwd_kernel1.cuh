@@ -94,7 +94,8 @@ template <
     int CHUNK,
     int D,
     int NumThreads,
-    bool IsVarlen = true
+    bool IsVarlen = true,
+    bool WarmupOnly = false
 >
 __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaLoadQ const tma_load_q,
@@ -115,7 +116,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int64_t const* cu_seqlens,
     int total_tiles,
     float const* A_log_ptr,
-    float gate_scale
+    float gate_scale,
+    int const* num_warmup_chunks_ptr
 ) {
     // --- constants
     using BF16 = cutlass::bfloat16_t;
@@ -152,7 +154,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
 
     if constexpr (IsVarlen) {
         // Linear scan on cu_seqlens to find (seq_idx, local_t)
-        seq_idx = 0;
+        seq_idx = -1;
         tiles_before = 0;
         for (int i = 0; i < N; i++) {
             int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
@@ -163,6 +165,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
             }
             tiles_before += n_tiles;
         }
+        // Early exit for excess CTAs that don't map to any sequence
+        if (seq_idx < 0) return;
         local_t = global_tile_idx - tiles_before;
         bos = cu_seqlens[seq_idx];
         eos = cu_seqlens[seq_idx + 1];
@@ -179,6 +183,12 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     t_tiles_this_seq = (seq_len + CHUNK - 1) / CHUNK;
     // Early exit for excess CTAs (total_tiles is an upper bound)
     if (local_t >= t_tiles_this_seq) return;
+    // WarmupOnly: skip tiles outside the warmup suffix
+    if constexpr (WarmupOnly) {
+        int warmup = num_warmup_chunks_ptr[seq_idx];
+        int t_start = t_tiles_this_seq - min(warmup, t_tiles_this_seq);
+        if (local_t < t_start) return;
+    }
     // --- TMA load inputs (single-shot, no pipeline)
     // Only thread 0 issues TMA loads (not elect_one_sync which is per-warp)
     if (threadIdx.x == 0) {

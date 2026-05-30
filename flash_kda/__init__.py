@@ -1,5 +1,5 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+from flash_kda_C import fwd as _fwd_raw, get_workspace_size, state_only as _state_only_raw
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
@@ -39,3 +39,41 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+
+
+def state_only(k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens, num_warmup_chunks, calc_mt=False):
+    """FlashKDA state-only kernel: computes final recurrent state without output.
+
+    Runs only the state recurrence on the last `num_warmup_chunks` chunks of
+    each segment. Used by CP to efficiently obtain ht without a full forward pass.
+
+    Args:
+        k, v, g, beta: Same as fwd().
+        A_log, dt_bias, lower_bound: Same as fwd().
+        cu_seqlens (torch.Tensor): Cumulative sequence lengths, int64, [N+1].
+        num_warmup_chunks (torch.Tensor): Number of trailing chunks to process
+            per segment, int32, shape [N].
+        calc_mt (bool): If True, also compute the transition matrix mt.
+
+    Returns:
+        ht (torch.Tensor): Final state per segment, fp32, shape [N, H, D, D].
+        mt (torch.Tensor or None): Transition matrix per segment, fp32,
+            shape [N, H, D, D]. Only returned when calc_mt=True.
+    """
+    H = k.shape[2]
+    D = k.shape[3]
+    N = cu_seqlens.numel() - 1
+    ht = torch.empty(N, H, D, D, dtype=torch.float32, device=k.device)
+    mt = torch.empty(N, H, D, D, dtype=torch.float32, device=k.device) if calc_mt else None
+    _state_only_raw(k, v, g, beta, A_log, dt_bias, lower_bound, ht, mt, cu_seqlens, num_warmup_chunks)
+    if calc_mt:
+        return ht, mt
+    return ht
+
+
+def fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+           initial_state=None, final_state=None, cu_seqlens=None, auto_cp=True):
+    """FlashKDA forward with intra-card context parallelism. See flash_kda.cp for details."""
+    from flash_kda.cp import fwd_cp as _fwd_cp
+    return _fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+                   initial_state, final_state, cu_seqlens, auto_cp)

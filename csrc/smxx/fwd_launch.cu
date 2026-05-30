@@ -1,6 +1,7 @@
 #include "fwd.h"
 #include "fwd_kernel1.cuh"
 #include "fwd_kernel2.cuh"
+#include "fwd_state_only.cuh"
 
 // ==================== launch_fwd ====================
 template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
@@ -168,7 +169,7 @@ void launch_fwd(
             tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
             tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
-            A_log_ptr, gate_scale
+            A_log_ptr, gate_scale, nullptr
         );
     }
 #endif
@@ -208,6 +209,429 @@ void launch_fwd(
     }
 #endif
 }
+
+// ==================== launch_kernel1_only ====================
+template <int D>
+void launch_kernel1_only(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    float scale,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream
+) {
+    using BF16 = cutlass::bfloat16_t;
+    constexpr int CHUNK = 16;
+
+    using K1L = K1Layouts<D, CHUNK>;
+    using WS = WorkspaceSizes<CHUNK, D>;
+
+    using TMAQKLayout = typename K1L::TMAQKLayout;
+    using TMAGLayout = typename K1L::TMAGLayout;
+    using TMABetaSmemLayout = typename K1L::TMABetaSmemLayout;
+    using TMAVOLayout = typename K1L::TMAVOLayout;
+    using TMALMLayout = typename K1L::TMALMLayout;
+    using TMAGTotalSmemLayout = typename K1L::TMAGTotalSmemLayout;
+
+    auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
+    auto beta_gmem_layout = make_layout(make_shape(H * T_total));
+
+    int64_t n_ht = int64_t(H) * total_tiles;
+    char* ws = reinterpret_cast<char*>(workspace_ptr);
+    BF16*  ws_kd  = reinterpret_cast<BF16*>(ws);
+    BF16*  ws_qd  = reinterpret_cast<BF16*>(ws + n_ht * WS::kKDecayed);
+    BF16*  ws_kr  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed));
+    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
+    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
+    BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
+
+    auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
+    auto ws_qd_gmem_layout = ws_kd_gmem_layout;
+    auto ws_kr_gmem_layout = ws_kd_gmem_layout;
+    auto ws_gt_gmem_layout = make_layout(make_shape(int(n_ht), D), LayoutRight{});
+    auto ws_lm_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
+
+    Tensor m_q = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
+    Tensor m_k = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
+    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
+    Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
+
+    Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
+    Tensor m_ws_qd  = make_tensor(make_gmem_ptr(ws_qd), ws_qd_gmem_layout);
+    Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
+    Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
+    Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
+    Tensor m_ws_mqk = make_tensor(make_gmem_ptr(ws_mqk), ws_lm_gmem_layout);
+
+    auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
+    Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
+
+    auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
+    auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
+    auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+    auto tma_load_g    = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
+    auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
+
+    auto tma_store_ws_kd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kd, TMAVOLayout{});
+    auto tma_store_ws_qd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_qd, TMAVOLayout{});
+    auto tma_store_ws_kr  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kr, TMAVOLayout{});
+    auto tma_store_ws_gt  = make_tma_copy(SM90_TMA_STORE{}, m_ws_gt, TMAGTotalSmemLayout{});
+    auto tma_store_ws_inv = make_tma_copy(SM90_TMA_STORE{}, m_ws_inv, TMALMLayout{});
+    auto tma_store_ws_mqk = make_tma_copy(SM90_TMA_STORE{}, m_ws_mqk, TMALMLayout{});
+
+    constexpr int kK1Threads = 256;
+    using SharedStorageK1T = SharedStorageK1<K1L>;
+    int smem_size_k1 = sizeof(SharedStorageK1T);
+
+    auto kernel1 = _flash_kda_fwd_prepare<
+        decltype(tma_load_q), decltype(tma_load_k),
+        decltype(tma_load_beta),
+        decltype(tma_load_g), decltype(tma_load_dt_bias),
+        decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr),
+        decltype(tma_store_ws_gt), decltype(tma_store_ws_inv), decltype(tma_store_ws_mqk),
+        CHUNK, D, kK1Threads, true  // IsVarlen=true
+    >;
+
+    cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1);
+
+    dim3 grid_k1(total_tiles, H);
+    dim3 block_k1(kK1Threads);
+
+    kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+        tma_load_q, tma_load_k, tma_load_beta,
+        tma_load_g, tma_load_dt_bias,
+        tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
+        tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
+        scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
+        A_log_ptr, gate_scale, nullptr
+    );
+}
+
+// Explicit instantiation for launch_kernel1_only
+template void launch_kernel1_only<128>(
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    float, void*, int, int, int, int,
+    int64_t const*, float const*, float const*, float, cudaStream_t);
+
+// ==================== launch_kernel1_warmup_only ====================
+// Same as launch_kernel1_only but with WarmupOnly=true: non-warmup tiles early-exit.
+template <int D>
+void launch_kernel1_warmup_only(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    float scale,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+) {
+    using BF16 = cutlass::bfloat16_t;
+    constexpr int CHUNK = 16;
+
+    using K1L = K1Layouts<D, CHUNK>;
+    using WS = WorkspaceSizes<CHUNK, D>;
+
+    using TMAQKLayout = typename K1L::TMAQKLayout;
+    using TMAGLayout = typename K1L::TMAGLayout;
+    using TMABetaSmemLayout = typename K1L::TMABetaSmemLayout;
+    using TMAVOLayout = typename K1L::TMAVOLayout;
+    using TMALMLayout = typename K1L::TMALMLayout;
+    using TMAGTotalSmemLayout = typename K1L::TMAGTotalSmemLayout;
+
+    auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
+    auto beta_gmem_layout = make_layout(make_shape(H * T_total));
+
+    int64_t n_ht = int64_t(H) * total_tiles;
+    char* ws = reinterpret_cast<char*>(workspace_ptr);
+    BF16*  ws_kd  = reinterpret_cast<BF16*>(ws);
+    BF16*  ws_qd  = reinterpret_cast<BF16*>(ws + n_ht * WS::kKDecayed);
+    BF16*  ws_kr  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed));
+    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
+    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
+    BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
+
+    auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
+    auto ws_qd_gmem_layout = ws_kd_gmem_layout;
+    auto ws_kr_gmem_layout = ws_kd_gmem_layout;
+    auto ws_gt_gmem_layout = make_layout(make_shape(int(n_ht), D), LayoutRight{});
+    auto ws_lm_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
+
+    Tensor m_q = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
+    Tensor m_k = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
+    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
+    Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
+
+    Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
+    Tensor m_ws_qd  = make_tensor(make_gmem_ptr(ws_qd), ws_qd_gmem_layout);
+    Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
+    Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
+    Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
+    Tensor m_ws_mqk = make_tensor(make_gmem_ptr(ws_mqk), ws_lm_gmem_layout);
+
+    auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
+    Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
+
+    auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
+    auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
+    auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+    auto tma_load_g    = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
+    auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
+
+    auto tma_store_ws_kd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kd, TMAVOLayout{});
+    auto tma_store_ws_qd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_qd, TMAVOLayout{});
+    auto tma_store_ws_kr  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kr, TMAVOLayout{});
+    auto tma_store_ws_gt  = make_tma_copy(SM90_TMA_STORE{}, m_ws_gt, TMAGTotalSmemLayout{});
+    auto tma_store_ws_inv = make_tma_copy(SM90_TMA_STORE{}, m_ws_inv, TMALMLayout{});
+    auto tma_store_ws_mqk = make_tma_copy(SM90_TMA_STORE{}, m_ws_mqk, TMALMLayout{});
+
+    constexpr int kK1Threads = 256;
+    using SharedStorageK1T = SharedStorageK1<K1L>;
+    int smem_size_k1 = sizeof(SharedStorageK1T);
+
+    auto kernel1 = _flash_kda_fwd_prepare<
+        decltype(tma_load_q), decltype(tma_load_k),
+        decltype(tma_load_beta),
+        decltype(tma_load_g), decltype(tma_load_dt_bias),
+        decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr),
+        decltype(tma_store_ws_gt), decltype(tma_store_ws_inv), decltype(tma_store_ws_mqk),
+        CHUNK, D, kK1Threads, true, true  // IsVarlen=true, WarmupOnly=true
+    >;
+
+    cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1);
+
+    dim3 grid_k1(total_tiles, H);
+    dim3 block_k1(kK1Threads);
+
+    kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
+        tma_load_q, tma_load_k, tma_load_beta,
+        tma_load_g, tma_load_dt_bias,
+        tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
+        tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
+        scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
+        A_log_ptr, gate_scale, num_warmup_chunks_ptr
+    );
+}
+
+// Explicit instantiation for launch_kernel1_warmup_only
+template void launch_kernel1_warmup_only<128>(
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    float, void*, int, int, int, int,
+    int64_t const*, float const*, float const*, float,
+    int const*, cudaStream_t);
+
+// ==================== launch_state_only ====================
+template <int D>
+void launch_state_only(
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void* workspace_ptr,
+    float* final_state_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+) {
+    using BF16 = cutlass::bfloat16_t;
+    constexpr int kInputStages = 3;
+    constexpr int CHUNK = 16;
+
+    using SOL = StateOnlyLayouts<D, CHUNK>;
+    using WS = WorkspaceSizes<CHUNK, D>;
+
+    using TMAVOLayout = typename SOL::TMAVOLayout;
+    using TMABetaSmemLayout = typename SOL::TMABetaSmemLayout;
+    using TMALMLayout = typename SOL::TMALMLayout;
+    using TMAGTotalSmemLayout = typename SOL::TMAGTotalSmemLayout;
+    using TMAFP32StateSmemLayout = typename SOL::TMAFP32StateSmemLayout;
+
+    auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
+    auto beta_gmem_layout = make_layout(make_shape(H * T_total));
+    auto state_gmem_layout = make_layout(make_shape(N * H, D, D), LayoutRight{});
+
+    Tensor m_v = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
+    Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
+
+    // Workspace layout
+    int64_t n_ht = int64_t(H) * total_tiles;
+    char* ws = reinterpret_cast<char*>(workspace_ptr);
+    BF16*  ws_kd  = reinterpret_cast<BF16*>(ws);
+    BF16*  ws_kr  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed));
+    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
+    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
+
+    auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
+    auto ws_kr_gmem_layout = ws_kd_gmem_layout;
+    auto ws_gt_gmem_layout = make_layout(make_shape(int(n_ht), D), LayoutRight{});
+    auto ws_lm_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
+
+    Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
+    Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
+    Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
+    Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
+
+    Tensor m_final = make_tensor(make_gmem_ptr(final_state_ptr), state_gmem_layout);
+
+    // TMA descriptors
+    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+    auto tma_load_beta  = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+    auto tma_load_ws_kd = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kd, TMAVOLayout{});
+    auto tma_load_ws_kr = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kr, TMAVOLayout{});
+    auto tma_load_ws_gt = make_tma_copy(SM90_TMA_LOAD{}, m_ws_gt, TMAGTotalSmemLayout{});
+    auto tma_load_ws_inv = make_tma_copy(SM90_TMA_LOAD{}, m_ws_inv, TMALMLayout{});
+    auto tma_store_state = make_tma_copy(SM90_TMA_STORE{}, m_final, TMAFP32StateSmemLayout{});
+
+    // Launch state_only kernel
+    constexpr int kThreads = 32 + 128;  // 4 MMA warps + 1 LOAD warp (no STORE warp)
+    using SharedStorageSOT = SharedStorageStateOnly<SOL, kInputStages>;
+    int smem_size = sizeof(SharedStorageSOT);
+
+    auto kernel = _flash_kda_state_only<
+        decltype(tma_load_v), decltype(tma_load_beta),
+        decltype(tma_load_ws_kd), decltype(tma_load_ws_kr),
+        decltype(tma_load_ws_gt), decltype(tma_load_ws_inv),
+        decltype(tma_store_state),
+        CHUNK, D, kInputStages, kThreads
+    >;
+
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+    dim3 grid(N, H);
+    dim3 block(kThreads);
+
+    kernel<<<grid, block, smem_size, stream>>>(
+        tma_load_v, tma_load_beta,
+        tma_load_ws_kd, tma_load_ws_kr,
+        tma_load_ws_gt, tma_load_ws_inv,
+        tma_store_state,
+        T_total, H, N, cu_seqlens_ptr, total_tiles,
+        num_warmup_chunks_ptr
+    );
+}
+
+// Explicit instantiation for launch_state_only
+template void launch_state_only<128>(
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    void*, float*, int, int, int, int,
+    int64_t const*, int const*, cudaStream_t);
+
+// ==================== launch_mt_only ====================
+// Computes transition matrix mt using the same kernel with CalcMt=true.
+template <int D>
+void launch_mt_only(
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void* workspace_ptr,
+    float* mt_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+) {
+    using BF16 = cutlass::bfloat16_t;
+    constexpr int kInputStages = 3;
+    constexpr int CHUNK = 16;
+
+    using SOL = StateOnlyLayouts<D, CHUNK>;
+    using WS = WorkspaceSizes<CHUNK, D>;
+
+    using TMAVOLayout = typename SOL::TMAVOLayout;
+    using TMABetaSmemLayout = typename SOL::TMABetaSmemLayout;
+    using TMALMLayout = typename SOL::TMALMLayout;
+    using TMAGTotalSmemLayout = typename SOL::TMAGTotalSmemLayout;
+    using TMAFP32StateSmemLayout = typename SOL::TMAFP32StateSmemLayout;
+
+    auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
+    auto beta_gmem_layout = make_layout(make_shape(H * T_total));
+    auto state_gmem_layout = make_layout(make_shape(N * H, D, D), LayoutRight{});
+
+    Tensor m_v = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
+    Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
+
+    int64_t n_ht = int64_t(H) * total_tiles;
+    char* ws = reinterpret_cast<char*>(workspace_ptr);
+    BF16*  ws_kd  = reinterpret_cast<BF16*>(ws);
+    BF16*  ws_kr  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed));
+    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
+    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
+
+    auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
+    auto ws_kr_gmem_layout = ws_kd_gmem_layout;
+    auto ws_gt_gmem_layout = make_layout(make_shape(int(n_ht), D), LayoutRight{});
+    auto ws_lm_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
+
+    Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
+    Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
+    Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
+    Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
+
+    Tensor m_mt = make_tensor(make_gmem_ptr(mt_ptr), state_gmem_layout);
+
+    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+    auto tma_load_beta  = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
+    auto tma_load_ws_kd = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kd, TMAVOLayout{});
+    auto tma_load_ws_kr = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kr, TMAVOLayout{});
+    auto tma_load_ws_gt = make_tma_copy(SM90_TMA_LOAD{}, m_ws_gt, TMAGTotalSmemLayout{});
+    auto tma_load_ws_inv = make_tma_copy(SM90_TMA_LOAD{}, m_ws_inv, TMALMLayout{});
+    auto tma_store_mt = make_tma_copy(SM90_TMA_STORE{}, m_mt, TMAFP32StateSmemLayout{});
+
+    constexpr int kThreads = 32 + 128;
+    using SharedStorageSOT = SharedStorageStateOnly<SOL, kInputStages>;
+    int smem_size = sizeof(SharedStorageSOT);
+
+    auto kernel = _flash_kda_state_only<
+        decltype(tma_load_v), decltype(tma_load_beta),
+        decltype(tma_load_ws_kd), decltype(tma_load_ws_kr),
+        decltype(tma_load_ws_gt), decltype(tma_load_ws_inv),
+        decltype(tma_store_mt),
+        CHUNK, D, kInputStages, kThreads, true  // CalcMt=true
+    >;
+
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+    dim3 grid(N, H);
+    dim3 block(kThreads);
+
+    kernel<<<grid, block, smem_size, stream>>>(
+        tma_load_v, tma_load_beta,
+        tma_load_ws_kd, tma_load_ws_kr,
+        tma_load_ws_gt, tma_load_ws_inv,
+        tma_store_mt,
+        T_total, H, N, cu_seqlens_ptr, total_tiles,
+        num_warmup_chunks_ptr
+    );
+}
+
+// Explicit instantiation for launch_mt_only
+template void launch_mt_only<128>(
+    cutlass::bfloat16_t const*, cutlass::bfloat16_t const*,
+    void*, float*, int, int, int, int,
+    int64_t const*, int const*, cudaStream_t);
 
 // Explicit instantiations
 #define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL) \

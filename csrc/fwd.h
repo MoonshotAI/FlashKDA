@@ -25,3 +25,72 @@ void launch_fwd(
     float gate_scale,
     cudaStream_t stream
 );
+
+template <int D>
+void launch_kernel1_only(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    float scale,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream
+);
+
+template <int D>
+void launch_kernel1_warmup_only(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* g_bf16_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    float scale,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+);
+
+template <int D>
+void launch_state_only(
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void* workspace_ptr,
+    float* final_state_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+);
+
+template <int D>
+void launch_mt_only(
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void* workspace_ptr,
+    float* mt_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N,
+    int64_t const* cu_seqlens_ptr,
+    int const* num_warmup_chunks_ptr,
+    cudaStream_t stream
+);
