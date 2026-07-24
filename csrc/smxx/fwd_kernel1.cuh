@@ -82,6 +82,26 @@ struct SharedStorageK1 {
     alignas(16) cutlass::arch::ClusterTransactionBarrier tma_load_barrier;
 };
 
+// Build prefix-sum of per-sequence tile counts, so Kernel 1 can map
+// global_tile_idx -> seq_idx with an O(log N) binary search instead of an
+// O(N) linear scan per CTA in varlen mode.
+__global__ void _flash_kda_build_tile_prefix(
+    int64_t const* __restrict__ cu_seqlens,
+    int N,
+    int chunk,
+    int* __restrict__ tile_prefix
+) {
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        tile_prefix[0] = 0;
+        for (int i = 0; i < N; ++i) {
+            int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
+            acc += (slen + chunk - 1) / chunk;
+            tile_prefix[i + 1] = acc;
+        }
+    }
+}
+
 // ==================== Kernel 1: Prepare ====================
 template <
     class TmaLoadQ,
@@ -115,7 +135,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int64_t const* cu_seqlens,
     int total_tiles,
     float const* A_log_ptr,
-    float gate_scale
+    float gate_scale,
+    int const* tile_prefix
 ) {
     // --- constants
     using BF16 = cutlass::bfloat16_t;
@@ -151,18 +172,14 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int seq_len, t_tiles_this_seq;
 
     if constexpr (IsVarlen) {
-        // Linear scan on cu_seqlens to find (seq_idx, local_t)
-        seq_idx = 0;
-        tiles_before = 0;
-        for (int i = 0; i < N; i++) {
-            int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
-            int n_tiles = (slen + CHUNK - 1) / CHUNK;
-            if (tiles_before + n_tiles > global_tile_idx) {
-                seq_idx = i;
-                break;
-            }
-            tiles_before += n_tiles;
+        int lo = 0, hi = N;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) >> 1;
+            if (tile_prefix[mid] <= global_tile_idx) lo = mid;
+            else hi = mid;
         }
+        seq_idx = lo;
+        tiles_before = tile_prefix[lo];
         local_t = global_tile_idx - tiles_before;
         bos = cu_seqlens[seq_idx];
         eos = cu_seqlens[seq_idx + 1];

@@ -68,6 +68,8 @@ void launch_fwd(
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
 
+    int* ws_tile_prefix = reinterpret_cast<int*>(ws + n_ht * WS::kPerTile);
+
     auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
     auto ws_qd_gmem_layout = ws_kd_gmem_layout;
     auto ws_kr_gmem_layout = ws_kd_gmem_layout;
@@ -159,6 +161,11 @@ void launch_fwd(
 
         cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1);
 
+        if constexpr (IsVarlen) {
+            _flash_kda_build_tile_prefix<<<1, 32, 0, stream>>>(
+                cu_seqlens_ptr, N, CHUNK, ws_tile_prefix);
+        }
+
         dim3 grid_k1(total_tiles, H);
         dim3 block_k1(kK1Threads);
 
@@ -168,7 +175,7 @@ void launch_fwd(
             tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
             tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
-            A_log_ptr, gate_scale
+            A_log_ptr, gate_scale, ws_tile_prefix
         );
     }
 #endif
