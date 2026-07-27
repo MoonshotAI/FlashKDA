@@ -73,7 +73,7 @@ See [BENCHMARK_H20.md](BENCHMARK_H20.md).
 bash tests/test.sh
 ```
 
-- `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
+- `tests/test_fwd.py` — correctness tests (within one BF16 ULP of the torch reference; compared with `flash-linear-attention`)
 
 
 ## Kernel API
