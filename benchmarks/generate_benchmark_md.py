@@ -26,12 +26,13 @@ DEFAULT_DEVICE_LABEL = "Hopper / H20"
 FLA_CHUNK_KDA_OPTIONS_MD = (
     "- `fla_chunk_kda` configuration: `use_gate_in_kernel=True`, "
     "`use_qk_l2norm_in_kernel=True`, `use_beta_sigmoid_in_kernel=True`, "
-    "`lower_bound=-5`, `transpose_state_layout=True`"
+    "`safe_gate=True`, `lower_bound=-5`, `state_v_first=True`, "
+    "`FLA_FLASH_KDA=0`"
 )
 FLA_CHUNK_GDN_OPTIONS_MD = (
     "- `fla_chunk_gated_delta_rule` configuration: scalar per-head gate "
     "`g` of shape `(1, T, H)`, `use_qk_l2norm_in_kernel=True`, "
-    "`transpose_state_layout=True`"
+    "`state_v_first=True`"
 )
 
 RE_HEADER_FIXED = re.compile(
