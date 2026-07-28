@@ -2,6 +2,8 @@
 #include "fwd_kernel1.cuh"
 #include "fwd_kernel2.cuh"
 
+#include <c10/cuda/CUDAException.h>
+
 // ==================== launch_fwd ====================
 template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
 void launch_fwd(
@@ -157,7 +159,8 @@ void launch_fwd(
             CHUNK, D, kK1Threads, IsVarlen
         >;
 
-        cudaFuncSetAttribute(kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1);
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k1));
 
         dim3 grid_k1(total_tiles, H);
         dim3 block_k1(kK1Threads);
@@ -191,7 +194,8 @@ void launch_fwd(
             HasStateIn, HasStateOut, StateFP32, IsVarlen
         >;
 
-        cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2));
 
         dim3 grid_k2(N, H);
         dim3 block_k2(kK2Threads);
