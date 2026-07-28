@@ -245,6 +245,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             constexpr uint32_t kStateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(BF16);
 
             shared_storage.state_acc_tma_barrier.init(1);
+            cutlass::arch::fence_barrier_init();  // generic init -> visible to async proxy (TMA complete-tx)
             shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
@@ -273,6 +274,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             constexpr uint32_t kFP32StateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(float);
 
             shared_storage.state_acc_tma_barrier.init(1);
+            cutlass::arch::fence_barrier_init();  // generic init -> visible to async proxy (TMA complete-tx)
             shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
@@ -309,6 +311,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 buf[i] = BF16(0);
             }
         }
+        // generic writes -> visible to async proxy (TMA state store covers t_tiles==0)
+        cutlass::arch::fence_view_async_shared();
         __syncthreads();
     }
 #endif
@@ -808,6 +812,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             shared_storage.state_acc.begin(),
             reinterpret_cast<float*>(shared_storage.state_fp32_buf),
             threadIdx.x);
+        cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
         __syncthreads();  // conversion complete
 
         if (warp_role == WarpRole::STORE && lane_predicate) {
