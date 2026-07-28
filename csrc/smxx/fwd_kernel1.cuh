@@ -184,6 +184,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     if (threadIdx.x == 0) {
         using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
         shared_storage.tma_load_barrier.init(1);
+        cutlass::arch::fence_barrier_init();  // generic init -> visible to async proxy (TMA complete-tx)
         shared_storage.tma_load_barrier.arrive_and_expect_tx(kTmaTransactionBytes);
 
         Tensor g_q = tma_load_q.get_tma_tensor(make_shape(H, T_total, D));
