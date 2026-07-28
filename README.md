@@ -33,9 +33,10 @@ Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chu
 
 **Requirements**
 
-1. Install `flash-linear-attention >= 0.5.0`:
+1. Install a compatible `flash-linear-attention` 0.5 release. FlashKDA's
+   raw-gate/raw-beta dispatch contract requires FLA 0.5.1 or newer:
    ```bash
-   pip install -U flash-linear-attention
+   pip install -U "flash-linear-attention>=0.5.1,<0.6"
    ```
 2. Call `chunk_kda` under `torch.inference_mode()` 
    ```python
@@ -54,7 +55,7 @@ Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chu
            safe_gate=True,
            A_log=A_log, dt_bias=dt_bias,
            lower_bound=lower_bound,
-           transpose_state_layout=True,
+           state_v_first=True,
            cu_seqlens=cu_seqlens,
        )
    ```

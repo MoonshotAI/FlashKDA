@@ -1,7 +1,13 @@
+import os
 import torch
 import flash_kda
 import torch.nn.functional as F
 import math
+
+# Keep the FLA baseline independent instead of dispatching chunk_kda back to
+# the FlashKDA implementation being benchmarked.
+os.environ["FLA_FLASH_KDA"] = "0"
+
 from fla.ops.kda import chunk_kda
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
@@ -104,9 +110,10 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             use_gate_in_kernel=True,
             use_qk_l2norm_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
+            safe_gate=True,
             A_log=A_log, dt_bias=dt_bias,
             lower_bound=LOWER_BOUND,
-            transpose_state_layout=True,
+            state_v_first=True,
             **extra,
         )
 
@@ -124,7 +131,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             initial_state=h0_gdn,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
-            transpose_state_layout=True,
+            state_v_first=True,
             **extra,
         )
 
