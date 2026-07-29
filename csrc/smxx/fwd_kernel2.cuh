@@ -743,12 +743,17 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     }
 
 #ifndef TMA_DISABLE_ALL
-    if (warp_role == WarpRole::STORE && lane_predicate) {
+    if (warp_role == WarpRole::STORE) {
         Tensor g_out = tma_store_out.get_tma_tensor(make_shape(H, T_total, D));
         auto cta_tma_store = tma_store_out.get_slice(Int<0>{});
         StorePipelineState out_read;
+        int lane_idx = threadIdx.x % kWarpSize;
         for (int t = 0; t < t_tiles; ++t) {
-            store_pipeline.consumer_wait(out_read);
+            if (lane_predicate) {
+                store_pipeline.consumer_wait(out_read);
+            }
+            __syncwarp();
+
             int stage = out_read.index();
             int actual_len = min(CHUNK, seq_len - t * CHUNK);
 
@@ -756,15 +761,14 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             if (actual_len < CHUNK) {
                 // Manual store for tail tile to avoid overwriting next sequence
-                // Only one thread (lane_predicate) runs here, so loop over all D
                 Tensor s_out = make_tensor(make_smem_ptr(out_stage_ptr), VOLayout{});
-                for (int row = 0; row < actual_len; ++row) {
+                for (int idx = lane_idx; idx < actual_len * D; idx += kWarpSize) {
+                    int row = idx / D;
+                    int col = idx % D;
                     int64_t global_base = (bos + t * CHUNK + row) * H * D + head_idx * D;
-                    for (int col = 0; col < D; ++col) {
-                        out_raw_ptr[global_base + col] = s_out(row, col);
-                    }
+                    out_raw_ptr[global_base + col] = s_out(row, col);
                 }
-            } else {
+            } else if (lane_predicate) {
                 // TMA store for full tiles
                 auto out_off = g_out.layout()(head_idx, int(bos) + t * CHUNK, 0);
                 Tensor g_out_tile = make_tensor(g_out.data() + out_off,
@@ -778,26 +782,34 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 tma_store_arrive();
             }
 
-            tma_store_wait<0>();
-            store_pipeline.consumer_release(out_read);
+            if (lane_predicate) {
+                tma_store_wait<0>();
+            }
+            // Every lane must finish reading the stage before its leader releases it.
+            __syncwarp();
+            if (lane_predicate) {
+                store_pipeline.consumer_release(out_read);
+            }
             ++out_read;
         }
 
         if constexpr (HasStateOut && !StateFP32) {
-            // BF16 state: TMA store directly from state_acc
-            Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, 0, 0);
-            Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_final.layout())));
-            Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
+            if (lane_predicate) {
+                // BF16 state: TMA store directly from state_acc
+                Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
+                auto state_off = g_final.layout()(seq_idx * H + head_idx, 0, 0);
+                Tensor g_final_tile = make_tensor(g_final.data() + state_off,
+                    make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_final.layout())));
+                Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
 
-            auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_store_final_state,
-                cta_tma_store_state.partition_S(s_state),
-                cta_tma_store_state.partition_D(g_final_tile)
-            );
-            tma_store_arrive();
+                auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
+                cute::copy(
+                    tma_store_final_state,
+                    cta_tma_store_state.partition_S(s_state),
+                    cta_tma_store_state.partition_D(g_final_tile)
+                );
+                tma_store_arrive();
+            }
         }
     }
 
