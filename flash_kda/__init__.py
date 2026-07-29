@@ -1,5 +1,12 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+
+from .torch_backend import has_cpu_extension, torch_kda
+
+try:
+    from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+except ImportError:
+    _fwd_raw = None
+    get_workspace_size = None
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
@@ -28,14 +35,50 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     Notes:
         * Currently requires ``K = V = 128``.
-        * All input tensors must be CUDA, contiguous, and have the dtypes
-          listed above.
+        * The native extension requires contiguous CUDA tensors with the
+          dtypes listed above.
+        * CPU tensors use the differentiable PyTorch backend. Prefer
+          :func:`torch_kda` for new training code because it returns tensors
+          instead of writing into caller-provided buffers.
     """
-    B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
-    T_total = B * T_seq
-    N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
+    if q.is_cuda and _fwd_raw is not None:
+        B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
+        T_total = B * T_seq
+        N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
+        workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
 
-    _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
-             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+        _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
+                 initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+        return
+
+    output, state = torch_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=final_state is not None,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        state_v_first=True,
+        cu_seqlens=cu_seqlens,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    out.copy_(output)
+    if final_state is not None:
+        final_state.copy_(state)
+
+
+def has_cuda_extension():
+    """Return whether the compiled FlashKDA CUDA extension is available."""
+    return _fwd_raw is not None
+
+
+__all__ = ["fwd", "has_cpu_extension", "has_cuda_extension", "torch_kda"]
