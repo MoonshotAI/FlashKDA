@@ -1,4 +1,11 @@
 import os
+import sys
+
+# Prefer a local flash-linear-attention checkout (FLA_REPO) so results are
+# measured against the intended Triton reference, not a stale site-packages copy.
+_FLA_REPO = os.environ.get("FLA_REPO", "/root/flash-linear-attention")
+if os.path.isdir(_FLA_REPO) and _FLA_REPO not in sys.path:
+    sys.path.insert(0, _FLA_REPO)
 
 # Pin the FLA baseline to the Triton path: with working dispatch, no_grad
 # chunk_kda calls would otherwise route to the flash_kda inference backend.
