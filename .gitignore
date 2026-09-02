@@ -2,6 +2,7 @@ build/**
 .cache/**
 *.egg-info/**
 *.so
+*.pyd
 *.ncu-rep
 *.nsys-rep
 .vscode/**
