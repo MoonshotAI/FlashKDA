@@ -52,6 +52,18 @@ def get_arch_flags():
     return flags
 
 
+train_sources = [
+    'csrc/train/binding.cpp',
+    'csrc/train/gate.cu',
+    'csrc/train/intra.cu',
+    'csrc/train/wy_fast.cu',
+    'csrc/train/chunk_o.cu',
+    'csrc/train/chunk_h.cu',
+    'csrc/train/bwd_dav.cu',
+    'csrc/train/bwd_intra.cu',
+    'csrc/train/bwd_wy_dqkg.cu',
+]
+
 ext_modules = [
     CUDAExtension(
         name='flash_kda_C',
@@ -64,6 +76,32 @@ ext_modules = [
             os.path.join(this_dir, 'cutlass', 'examples', 'common'),
             os.path.join(this_dir, 'cutlass', 'tools', 'util', 'include'),
             os.path.join(this_dir, 'csrc'),
+        ],
+        extra_compile_args={
+            'cxx': ['-O3', '-Wno-psabi'],
+            'nvcc': [
+                '-O3',
+                '-U__CUDA_NO_HALF_OPERATORS__',
+                '-U__CUDA_NO_HALF_CONVERSIONS__',
+                '-U__CUDA_NO_HALF2_OPERATORS__',
+                '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
+                '--expt-relaxed-constexpr',
+                '--expt-extended-lambda',
+                '--use_fast_math',
+                '--ptxas-options=-v,--register-usage-level=10,--warn-on-spills',
+                '-lineinfo',
+                *get_nvcc_thread_args(),
+                *get_arch_flags(),
+            ],
+        },
+    ),
+    CUDAExtension(
+        name='flash_kda_train_C',
+        sources=train_sources,
+        include_dirs=[
+            os.path.join(this_dir, 'cutlass', 'include'),
+            os.path.join(this_dir, 'csrc'),
+            os.path.join(this_dir, 'csrc', 'train'),
         ],
         extra_compile_args={
             'cxx': ['-O3', '-Wno-psabi'],
@@ -99,7 +137,7 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda'],
+    packages=['flash_kda', 'flash_kda.train'],
     cmdclass=cmdclass,
     zip_safe=False,
 )
