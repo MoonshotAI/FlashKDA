@@ -52,7 +52,8 @@ empirical B300 policy. For B5–B7, `>320` chunks selecting V1a is a conservativ
 unvalidated fallback, not a measured crossover. At H=64, B8 with `>=320` chunks
 and all B>8 workloads use baseline. For H!=64, supported calls use V1a at
 `>=128` chunks and baseline below that. A chunk is 16 tokens; the policy counts
-complete chunks per sequence. These thresholds are not claims for other GPUs.
+`ceil(T/16)` tiles per sequence, including a partial final tile. These thresholds
+are not claims for other GPUs.
 
 ## Using FlashKDA as an FLA backend
 

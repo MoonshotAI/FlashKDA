@@ -39,7 +39,7 @@ def run_case(B, T, expected_auto, warmup, iters, seed):
     dt_bias = torch.rand(H, D, dtype=torch.float32, device="cuda")
     initial = torch.randn((B, H, D, D), dtype=torch.bfloat16, device="cuda")
     initial_copy = initial.clone()
-    print(f"\nB={B} T={T} H={H} D={D} chunks={T // 16} expected_auto={expected_auto}")
+    print(f"\nB={B} T={T} H={H} D={D} chunks={(T + 15) // 16} expected_auto={expected_auto}")
 
     previous = os.environ.get("FLASH_KDA_K2_IMPL")
     try:

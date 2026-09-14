@@ -62,6 +62,13 @@ int main() {
         auto config = supported(test.batch, test.chunks);
         CHECK(flash_kda::chunks_per_sequence(config) == test.chunks);
         CHECK(select_k2_implementation(K2Mode::Auto, config) == test.expected);
+        // A partial final tile counts too, including at each AUTO boundary.
+        for (int tail : {1, 15}) {
+            auto partial = config;
+            partial.total_tokens = test.batch * ((test.chunks - 1) * 16 + tail);
+            CHECK(flash_kda::chunks_per_sequence(partial) == test.chunks);
+            CHECK(select_k2_implementation(K2Mode::Auto, partial) == test.expected);
+        }
         // Explicit requests ignore the empirical AUTO thresholds.
         CHECK(select_k2_implementation(K2Mode::V1A, config) == Impl::V1A);
         CHECK(select_k2_implementation(K2Mode::V1AE, config) == Impl::V1AE);

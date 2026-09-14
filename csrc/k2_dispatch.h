@@ -43,7 +43,7 @@ constexpr bool v1a_supported(K2DispatchConfig const& config) {
 constexpr int64_t chunks_per_sequence(K2DispatchConfig const& config) {
     if (config.is_varlen || config.sequences <= 0) return 0;
     const int64_t sequence_length = config.total_tokens / config.sequences;
-    return sequence_length / kK2ChunkSize;
+    return (sequence_length + kK2ChunkSize - 1) / kK2ChunkSize;
 }
 
 constexpr bool v1ae_supported(K2DispatchConfig const& config) {
