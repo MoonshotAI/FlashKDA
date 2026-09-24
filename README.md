@@ -7,8 +7,8 @@ FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on C
 - **2026-04-22** — Deep-Dive Blog: the design decisions behind FlashKDA v1, read it [here](docs/20260420-flashkda-v1-deep-dive.md).
 
 ## Requirements
-- SM90 and above
-- CUDA 12.9 and above
+- SM80 and above (SM80 Ampere path uses cooperative copies; SM90+ Hopper/Blackwell path uses TMA)
+- CUDA 12.2 and above
 - PyTorch 2.4 and above
 
 ## Installation
@@ -25,7 +25,7 @@ By default, the build detects the current CUDA device and compiles for that arch
 FLASH_KDA_CUDA_ARCHS=all pip install -v --no-build-isolation .
 ```
 
-Supported values are `auto` (default), `all`, or a comma-separated arch list such as `90a,100a`.
+Supported values are `auto` (default), `all`, or a comma-separated arch list such as `80,90a,100a`.
 
 ## Using FlashKDA as an FLA backend
 
@@ -66,6 +66,7 @@ Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chu
 ## Performance
 
 See [BENCHMARK_H20.md](BENCHMARK_H20.md).
+See [BENCHMARK_A800.md](BENCHMARK_A800.md).
 
 ## Tests
 
