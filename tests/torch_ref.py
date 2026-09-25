@@ -126,7 +126,7 @@ def inv_fwd_subst_16(L):
 # Torch reference implementation
 # ============================================================
 
-def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
+def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None, intermediate_state=None):
     """Torch reference, supports both fixed-length and variable-length sequences.
 
     Input: [B, T, H, D] (4D). B must be 1 when cu_seqlens is provided.
@@ -182,6 +182,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     else:
         work_state = torch.zeros(N, H, D, D, dtype=torch.bfloat16, device=device)
 
+    tile_base = 0
     for seq_idx in range(N):
         bos = cu_seqlens[seq_idx].item()
         eos = cu_seqlens[seq_idx + 1].item()
@@ -239,6 +240,10 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
                 work_state[seq_idx, h] = fp32_fma(delta_s, state_slice.to(torch.float32).t(), g_total_exp).to(torch.bfloat16).t()
 
                 out[t0:t0 + actual_len, h] = _out[:actual_len]
+                if intermediate_state is not None:
+                    intermediate_state[h, tile_base + chunk_idx].copy_(work_state[seq_idx, h])
+
+        tile_base += n_chunks
 
     if final_state is not None:
         if state_fp32:

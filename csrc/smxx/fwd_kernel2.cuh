@@ -128,6 +128,7 @@ template <
     bool HasStateIn = true,
     bool HasStateOut = true,
     bool StateFP32 = false,
+    bool HasIntermediateState = false,
     bool IsVarlen = true
 >
 __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
@@ -143,6 +144,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
+    cutlass::bfloat16_t* intermediate_state_ptr,
     int T_total,
     int H,
     int N,
@@ -731,6 +733,18 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             }
             }
             compute_barrier.arrive_and_wait();
+
+            if constexpr (HasIntermediateState) {
+                // StateSmemLayout maps the logical [D, D] state to its swizzled
+                // shared-memory storage. Snapshot after the whole update is
+                // visible so every chunk is independently reusable by a caller.
+                int64_t snapshot_offset =
+                    (int64_t(head_idx) * total_tiles + tile_base + t) * D * D;
+                for (int i = compute_tid; i < D * D; i += kComputeThreads) {
+                    intermediate_state_ptr[snapshot_offset + i] =
+                        s_acc(i / D, i % D);
+                }
+            }
 
 #ifndef TMA_DISABLE_ALL
             cutlass::arch::fence_view_async_shared();

@@ -3,7 +3,7 @@
 #include "fwd_kernel2.cuh"
 
 // ==================== launch_fwd ====================
-template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
+template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool HasIntermediateState, bool IsVarlen>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
@@ -13,6 +13,7 @@ void launch_fwd(
     void const* initial_state_ptr,
     float scale,
     void* final_state_ptr,
+    cutlass::bfloat16_t* intermediate_state_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
     int total_tiles,
@@ -195,7 +196,7 @@ void launch_fwd(
             decltype(tma_store_final_state),
             decltype(tma_store_out),
             CHUNK, D, kInputStages, kOutputStages, kK2Threads,
-            HasStateIn, HasStateOut, StateFP32, IsVarlen
+            HasStateIn, HasStateOut, StateFP32, HasIntermediateState, IsVarlen
         >;
 
         cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
@@ -210,29 +211,32 @@ void launch_fwd(
             tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
+            out_ptr, intermediate_state_ptr,
+            T_total, H, N, cu_seqlens_ptr, total_tiles
         );
     }
 #endif
 }
 
 // Explicit instantiations
-#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL) \
-    template void launch_fwd<D, HI, HO, FP32, VL>( \
+#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, HIS, VL) \
+    template void launch_fwd<D, HI, HO, FP32, HIS, VL>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
-        cutlass::bfloat16_t*, void*, int, int, int, int, \
+        cutlass::bfloat16_t*, cutlass::bfloat16_t*, void*, int, int, int, int, \
         int64_t const*, float const*, float const*, float, cudaStream_t);
 
-#define INSTANTIATE_STATE_VARIANTS(VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  VL)
+#define INSTANTIATE_STATE_VARIANTS(HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, false, false, HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  HIS, VL) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  HIS, VL)
 
-INSTANTIATE_STATE_VARIANTS(true)   // varlen
-INSTANTIATE_STATE_VARIANTS(false)  // non-varlen
+INSTANTIATE_STATE_VARIANTS(false, true)   // varlen, no chunk-state snapshots
+INSTANTIATE_STATE_VARIANTS(false, false)  // batched, no chunk-state snapshots
+INSTANTIATE_STATE_VARIANTS(true, true)    // varlen, chunk-state snapshots
+INSTANTIATE_STATE_VARIANTS(true, false)   // batched, chunk-state snapshots
