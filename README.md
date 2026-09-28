@@ -106,6 +106,7 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - Currently requires `K = V = 128`.
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
+- `cu_seqlens` may contain repeated offsets for zero-length sequences. Such sequences have no output tokens; their `final_state` equals `initial_state` when provided, or zero otherwise.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
 
 ## Development
