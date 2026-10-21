@@ -1,10 +1,11 @@
 import os
+import platform
 import subprocess
 from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
+from torch.utils.cpp_extension import CppExtension, CUDAExtension, BuildExtension, CUDA_HOME
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+ASCEND_HOME = os.getenv("ASCEND_HOME_PATH")
 
 
 def is_flag_set(flag: str) -> bool:
@@ -52,8 +53,13 @@ def get_arch_flags():
     return flags
 
 
-ext_modules = [
-    CUDAExtension(
+ext_modules = []
+packages = ['flash_kda']
+package_data = {}
+if CUDA_HOME is not None:
+    subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+    ext_modules.append(
+        CUDAExtension(
         name='flash_kda_C',
         sources=[
             'csrc/flash_kda.cpp',
@@ -82,9 +88,25 @@ ext_modules = [
                 *get_arch_flags(),
             ],
         },
+        )
     )
-]
+if ASCEND_HOME:
+    packages.append('flash_kda_npu')
+    package_data['flash_kda_npu'] = ['csrc/ascendc/*.cpp']
+    ascend_platform = os.path.join(ASCEND_HOME, platform.machine() + "-linux")
+    ext_modules.append(
+        CppExtension(
+            name='flash_kda_npu_C',
+            sources=['flash_kda_npu/csrc/flash_kda.cpp'],
+            include_dirs=[os.path.join(ascend_platform, 'include')],
+            library_dirs=[os.path.join(ascend_platform, 'lib64')],
+            libraries=['ascendcl', 'acl_rtc'],
+            extra_compile_args={'cxx': ['-O3', '-std=c++17']},
+        )
+    )
 cmdclass = {"build_ext": BuildExtension}
+# Separate backend artifacts so switching targets cannot reuse another wheel's files.
+build_name = "-".join(extension.name for extension in ext_modules) or "python"
 
 rev = os.getenv("FLASH_KDA_VERSION_SUFFIX", "")
 if not rev:
@@ -99,7 +121,10 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda'],
+    packages=packages,
+    package_data=package_data,
+    include_package_data=False,
+    options={"build": {"build_base": os.path.join("build", build_name)}},
     cmdclass=cmdclass,
     zip_safe=False,
 )

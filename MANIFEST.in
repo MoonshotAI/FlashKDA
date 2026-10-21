@@ -1,0 +1,3 @@
+include flash_kda_npu/*.py
+include flash_kda_npu/csrc/flash_kda.cpp
+include flash_kda_npu/csrc/ascendc/*.cpp
