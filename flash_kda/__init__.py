@@ -1,5 +1,10 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+
+try:
+    from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+except ImportError:
+    _fwd_raw = None
+    get_workspace_size = None
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
@@ -28,9 +33,20 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     Notes:
         * Currently requires ``K = V = 128``.
-        * All input tensors must be CUDA, contiguous, and have the dtypes
-          listed above.
+        * All input tensors must be contiguous, on the same CUDA or NPU
+          device, and have the dtypes listed above.
     """
+    if not q.is_cuda:
+        import flash_kda_npu
+
+        flash_kda_npu.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+                          initial_state=initial_state, final_state=final_state,
+                          cu_seqlens=cu_seqlens)
+        return
+
+    if _fwd_raw is None:
+        raise ImportError("flash_kda_C is required for the CUDA backend")
+
     B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
