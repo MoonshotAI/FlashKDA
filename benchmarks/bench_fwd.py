@@ -30,7 +30,10 @@ def bench_fn(fn, warmup, iters, repeats):
     return mean, mn, mx
 
 
-def run_case(seq_lens, H, D, warmup, iters, repeats):
+def run_case(seq_lens, H, D, warmup, iters, repeats, seed):
+    # Seed per case so a case produces the same inputs regardless of --mode or
+    # case ordering, which is what makes results comparable across runs/commits.
+    torch.manual_seed(seed)
     device = torch.device("cuda")
     LOWER_BOUND = -5.0
     scale_float = 1.0 / math.sqrt(D)
@@ -151,6 +154,8 @@ def main():
     p.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
     p.add_argument("--H", type=int, default=96)
     p.add_argument("--D", type=int, default=128)
+    p.add_argument("--seed", type=int, default=42,
+                   help="RNG seed, fixed per case for reproducible inputs")
     args = p.parse_args()
 
     cases = []
@@ -159,8 +164,9 @@ def main():
     if args.mode in ("varlen", "all"):
         cases.extend(VARLEN_CASES)
 
+    print(f"seed={args.seed}")
     for seq_lens in cases:
-        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats)
+        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats, args.seed)
 
 
 if __name__ == "__main__":
