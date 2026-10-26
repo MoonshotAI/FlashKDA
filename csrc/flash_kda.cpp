@@ -25,6 +25,53 @@ int64_t get_workspace_size(
     return H * total_tiles * per_tile_bytes + tile_prefix_bytes;
 }
 
+// Runtime dispatch between the SM80 cooperative-copy implementation and the
+// SM90+ TMA implementation.  Each extension is compiled with exactly one of
+// FLASH_KDA_SM80_ONLY / FLASH_KDA_SM90_ONLY so it only references its own path.
+template <bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
+static void dispatch_fwd(
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* g_ptr,
+    cutlass::bfloat16_t const* beta_ptr,
+    void const* initial_state_raw,
+    float scale_f,
+    void* final_state_raw,
+    cutlass::bfloat16_t* out_ptr,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N_val,
+    int64_t const* cu_seqlens_dev,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream,
+    int arch_major
+) {
+#if defined(FLASH_KDA_SM80_ONLY)
+    TORCH_CHECK(arch_major == 8, "flash_kda_C_sm80 requires an SM80 (Ampere) device");
+    flash_kda::sm80::launch_fwd<128, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+        q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr,
+        initial_state_raw, scale_f, final_state_raw, out_ptr,
+        workspace_ptr, total_tiles,
+        T_total, H, N_val, cu_seqlens_dev,
+        A_log_ptr, dt_bias_ptr, gate_scale, stream);
+#elif defined(FLASH_KDA_SM90_ONLY)
+    TORCH_CHECK(arch_major >= 9, "flash_kda_C_sm90 requires an SM90+ device");
+    flash_kda::sm90::launch_fwd<128, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+        q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr,
+        initial_state_raw, scale_f, final_state_raw, out_ptr,
+        workspace_ptr, total_tiles,
+        T_total, H, N_val, cu_seqlens_dev,
+        A_log_ptr, dt_bias_ptr, gate_scale, stream);
+#else
+    #error "Must define FLASH_KDA_SM80_ONLY or FLASH_KDA_SM90_ONLY"
+#endif
+}
+
 void fwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -135,6 +182,17 @@ void fwd(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    // Detect current device compute capability for runtime dispatch.
+    int current_device = c10::cuda::current_device();
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, current_device);
+    int const arch_major = prop.major;
+    TORCH_CHECK(
+        arch_major == 8 || arch_major >= 9,
+        "FlashKDA requires SM80 (Ampere) or newer; got compute capability ",
+        arch_major, ".", prop.minor
+    );
+
     constexpr int CHUNK = 16;
 
     // Get state pointers (nullptr if not present)
@@ -182,12 +240,12 @@ void fwd(
 
     // Dispatch based on state configuration and varlen
     #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
+        dispatch_fwd<HI, HO, FP32, VL>( \
             q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
             initial_state_raw, scale_f, final_state_raw, out_ptr, \
             workspace_ptr, total_tiles, \
             int(T_total), int(H), int(N_val), cu_seqlens_dev, \
-            A_log_ptr, dt_bias_ptr, gate_scale, stream)
+            A_log_ptr, dt_bias_ptr, gate_scale, stream, arch_major)
 
     #define DISPATCH_STATE(VL) \
         if (!has_state_in && !has_state_out) { \
