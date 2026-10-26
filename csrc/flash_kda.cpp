@@ -1,6 +1,9 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include "fwd.h"
+#include "k2_dispatch.h"
+#include <cstdlib>
+#include <string>
 
 int64_t get_workspace_size(
     int64_t T_total,
@@ -109,6 +112,14 @@ void fwd(
 
     TORCH_CHECK(D == 128, "currently only supports D == 128");
 
+    // Preserve the public default (baseline). Selection is read per call so
+    // correctness and benchmark tests can interleave implementations.
+    const char* requested_k2 = std::getenv("FLASH_KDA_K2_IMPL");
+    const std::string k2_impl_name = requested_k2 ? requested_k2 : "baseline";
+    const auto k2_mode = flash_kda::parse_k2_mode(k2_impl_name);
+    TORCH_CHECK(k2_mode != flash_kda::K2Mode::Invalid,
+                "FLASH_KDA_K2_IMPL must be auto, baseline, v1a, or v1ae");
+
     // Flatten [B, T, H, D] -> [B*T, H, D] (contiguous, same data pointer)
     auto q_3d = q.reshape({T_total, H, D});
     auto k_3d = k.reshape({T_total, H, D});
@@ -159,6 +170,50 @@ void fwd(
         N_val = B;
     }
 
+    int compute_major = 0, compute_minor = 0;
+    if (k2_mode != flash_kda::K2Mode::Baseline) {
+        TORCH_CHECK(
+            cudaDeviceGetAttribute(&compute_major, cudaDevAttrComputeCapabilityMajor,
+                                   q.get_device()) == cudaSuccess &&
+            cudaDeviceGetAttribute(&compute_minor, cudaDevAttrComputeCapabilityMinor,
+                                   q.get_device()) == cudaSuccess,
+            "Cannot query CUDA device capability for K2 implementation selection");
+    }
+
+    flash_kda::K2DispatchConfig k2_config;
+#if defined(FLASH_KDA_ENABLE_V1A)
+    k2_config.v1a_compiled = true;
+#endif
+#if defined(FLASH_KDA_ENABLE_V1AE)
+    k2_config.v1ae_compiled = true;
+#endif
+    k2_config.compute_major = compute_major;
+    k2_config.compute_minor = compute_minor;
+    k2_config.is_varlen = is_varlen;
+    k2_config.has_state_in = has_state_in;
+    k2_config.has_state_out = has_state_out;
+    k2_config.state_fp32 = state_fp32;
+    k2_config.total_tokens = T_total;
+    k2_config.sequences = N_val;
+    k2_config.heads = H;
+
+    const auto k2_implementation =
+        flash_kda::select_k2_implementation(k2_mode, k2_config);
+    if (k2_implementation == flash_kda::K2Implementation::Unsupported) {
+        if (k2_mode == flash_kda::K2Mode::V1AE) {
+            TORCH_CHECK(k2_config.v1ae_compiled,
+                        "Rebuild with FLASH_KDA_ENABLE_V1AE=1 to enable v1ae");
+            TORCH_CHECK(false,
+                        "v1ae requires SM103 and fixed-length BF16 initial_state and final_state");
+        }
+        TORCH_CHECK(k2_config.v1a_compiled,
+                    "Rebuild with FLASH_KDA_ENABLE_V1A=1 to enable v1a");
+        TORCH_CHECK(false,
+                    "v1a requires SM103 and fixed-length BF16 initial_state and final_state");
+    }
+    const bool use_v1a =
+        k2_implementation == flash_kda::K2Implementation::V1A;
+
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {
         auto& is = initial_state.value();
@@ -181,13 +236,15 @@ void fwd(
     }
 
     // Dispatch based on state configuration and varlen
-    #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
+    #define LAUNCH_IMPL(HI, HO, FP32, VL, V1A, EGRESS) \
+        launch_fwd<128, HI, HO, FP32, VL, V1A, EGRESS>( \
             q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
             initial_state_raw, scale_f, final_state_raw, out_ptr, \
             workspace_ptr, total_tiles, \
             int(T_total), int(H), int(N_val), cu_seqlens_dev, \
             A_log_ptr, dt_bias_ptr, gate_scale, stream)
+
+    #define LAUNCH(HI, HO, FP32, VL) LAUNCH_IMPL(HI, HO, FP32, VL, false, 0)
 
     #define DISPATCH_STATE(VL) \
         if (!has_state_in && !has_state_out) { \
@@ -206,7 +263,15 @@ void fwd(
             LAUNCH(true, false, false, VL); \
         }
 
-    if (is_varlen) {
+    if (k2_implementation == flash_kda::K2Implementation::V1AE) {
+#if defined(FLASH_KDA_ENABLE_V1AE)
+        LAUNCH_IMPL(true, true, false, false, false, 1);
+#endif
+    } else if (use_v1a) {
+#if defined(FLASH_KDA_ENABLE_V1A)
+        LAUNCH_IMPL(true, true, false, false, true, 0);
+#endif
+    } else if (is_varlen) {
         DISPATCH_STATE(true);
     } else {
         DISPATCH_STATE(false);
@@ -214,6 +279,7 @@ void fwd(
 
     #undef DISPATCH_STATE
     #undef LAUNCH
+    #undef LAUNCH_IMPL
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
