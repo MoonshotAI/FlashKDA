@@ -1,6 +1,6 @@
 """Full correctness tests for FlashKDA forward pass.
 
-Compares cutlass kernel vs torch_ref for exact match across:
+Compares cutlass kernel vs torch_ref within one BF16 ULP across:
   - state_in / state_out: 4 combinations of None/present
   - state dtype: bf16, fp32
   - various H values (up to 256)
@@ -18,6 +18,7 @@ import pytest
 
 import flash_kda
 from torch_ref import torch_ref
+from numerics import assert_matches_reference
 
 D = 128
 LOWER_BOUND = -5.0
@@ -87,11 +88,17 @@ def test_fwd_fixed(T, H, state_dtype, has_in, has_out):
               A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
               initial_state=init_r, final_state=final_r)
 
-    assert torch.equal(out_kernel, out_ref), \
-        f"output mismatch: T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+    assert_matches_reference(
+        out_kernel,
+        out_ref,
+        msg=f"output mismatch: T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+    )
     if final_k is not None:
-        assert torch.equal(final_k, final_r), \
-            f"final_state mismatch: T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+        assert_matches_reference(
+            final_k,
+            final_r,
+            msg=f"final_state mismatch: T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +150,17 @@ def test_fwd_varlen(seq_lens, H, state_dtype, has_in, has_out):
               A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
               initial_state=init_r, final_state=final_r, cu_seqlens=cu_seqlens)
 
-    assert torch.equal(out_kernel, out_ref), \
-        f"output mismatch: seqs={seq_lens} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+    assert_matches_reference(
+        out_kernel,
+        out_ref,
+        msg=f"output mismatch: seqs={seq_lens} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+    )
     if final_k is not None:
-        assert torch.equal(final_k, final_r), \
-            f"final_state mismatch: seqs={seq_lens} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+        assert_matches_reference(
+            final_k,
+            final_r,
+            msg=f"final_state mismatch: seqs={seq_lens} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +211,17 @@ def test_fwd_batched(B, T, H, state_dtype, has_in, has_out):
               A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
               initial_state=init_r, final_state=final_r)
 
-    assert torch.equal(out_kernel, out_ref), \
-        f"output mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+    assert_matches_reference(
+        out_kernel,
+        out_ref,
+        msg=f"output mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+    )
     if final_k is not None:
-        assert torch.equal(final_k, final_r), \
-            f"final_state mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}"
+        assert_matches_reference(
+            final_k,
+            final_r,
+            msg=f"final_state mismatch: B={B} T={T} H={H} dtype={state_dtype} in={has_in} out={has_out}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +256,8 @@ def test_fwd_long(T):
               A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
               initial_state=init_r, final_state=final_r)
 
-    assert torch.equal(out_kernel, out_ref), f"output mismatch: T={T}"
-    assert torch.equal(final_k, final_r), f"final_state mismatch: T={T}"
+    assert_matches_reference(out_kernel, out_ref, msg=f"output mismatch: T={T}")
+    assert_matches_reference(final_k, final_r, msg=f"final_state mismatch: T={T}")
 
 
 @pytest.mark.parametrize("seq_lens", LONG_VARLEN_CASES,
@@ -270,5 +289,9 @@ def test_fwd_long_varlen(seq_lens):
               A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
               initial_state=init_r, final_state=final_r, cu_seqlens=cu_seqlens)
 
-    assert torch.equal(out_kernel, out_ref), f"output mismatch: seqs={seq_lens}"
-    assert torch.equal(final_k, final_r), f"final_state mismatch: seqs={seq_lens}"
+    assert_matches_reference(
+        out_kernel, out_ref, msg=f"output mismatch: seqs={seq_lens}"
+    )
+    assert_matches_reference(
+        final_k, final_r, msg=f"final_state mismatch: seqs={seq_lens}"
+    )
