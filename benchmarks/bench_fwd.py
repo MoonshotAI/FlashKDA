@@ -144,6 +144,12 @@ VARLEN_CASES = [
     [1024] * 8,
 ]
 
+# Isolates the partial output-tile path: one tail tile per sequence and head.
+# Compare the same command before and after a kernel change.
+TAIL_STORE_CASES = [
+    [15],
+]
+
 
 def main():
     import argparse
@@ -151,7 +157,7 @@ def main():
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--repeats", type=int, default=5)
-    p.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
+    p.add_argument("--mode", choices=["fixed", "varlen", "tail-store", "all"], default="all")
     p.add_argument("--H", type=int, default=96)
     p.add_argument("--D", type=int, default=128)
     p.add_argument("--seed", type=int, default=42,
@@ -163,6 +169,8 @@ def main():
         cases.extend(FIXED_CASES)
     if args.mode in ("varlen", "all"):
         cases.extend(VARLEN_CASES)
+    if args.mode == "tail-store":
+        cases.extend(TAIL_STORE_CASES)
 
     print(f"seed={args.seed}")
     for seq_lens in cases:
