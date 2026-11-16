@@ -3,7 +3,8 @@
 #include "fwd_kernel2.cuh"
 
 // ==================== launch_fwd ====================
-template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
+template <int D, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen,
+          bool UseV1A, int V1AEgress>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,
@@ -184,7 +185,8 @@ void launch_fwd(
 #if BLOCK_LEVEL_K2 >= 0
     {
         constexpr int kK2Threads = 32 * 2 + 128;
-        using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
+        using SharedStorageK2T = SelectedSharedStorageK2<K2L, kInputStages, kOutputStages,
+                                                        UseV1A, V1AEgress>;
         int smem_size_k2 = sizeof(SharedStorageK2T);
 
         auto kernel2 = _flash_kda_fwd_recurrence<
@@ -195,10 +197,17 @@ void launch_fwd(
             decltype(tma_store_final_state),
             decltype(tma_store_out),
             CHUNK, D, kInputStages, kOutputStages, kK2Threads,
-            HasStateIn, HasStateOut, StateFP32, IsVarlen
+            HasStateIn, HasStateOut, StateFP32, IsVarlen, UseV1A, V1AEgress
         >;
 
         cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
+
+        if constexpr (UseV1A || V1AEgress != 0) {
+            // Preserve the validated register-state shared-memory carveout
+            // preference for these specializations only.
+            cudaFuncSetAttribute(kernel2, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+        }
 
         dim3 grid_k2(N, H);
         dim3 block_k2(kK2Threads);
@@ -210,6 +219,7 @@ void launch_fwd(
             tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
+            initial_state_ptr, final_state_ptr,
             out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
         );
     }
@@ -217,8 +227,8 @@ void launch_fwd(
 }
 
 // Explicit instantiations
-#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL) \
-    template void launch_fwd<D, HI, HO, FP32, VL>( \
+#define INSTANTIATE_LAUNCH_FWD(D, HI, HO, FP32, VL, V1A, EGRESS) \
+    template void launch_fwd<D, HI, HO, FP32, VL, V1A, EGRESS>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
@@ -226,13 +236,20 @@ void launch_fwd(
         int64_t const*, float const*, float const*, float, cudaStream_t);
 
 #define INSTANTIATE_STATE_VARIANTS(VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, VL) \
-    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  VL) \
-    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  VL)
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  true,  true,  VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, false, false, false, VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  false, VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, false, VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, false, true,  true,  VL, false, 0) \
+    INSTANTIATE_LAUNCH_FWD(128, true,  false, true,  VL, false, 0)
 
 INSTANTIATE_STATE_VARIANTS(true)   // varlen
 INSTANTIATE_STATE_VARIANTS(false)  // non-varlen
+
+#if defined(FLASH_KDA_ENABLE_V1A)
+INSTANTIATE_LAUNCH_FWD(128, true, true, false, false, true, 0)
+#endif
+#if defined(FLASH_KDA_ENABLE_V1AE)
+INSTANTIATE_LAUNCH_FWD(128, true, true, false, false, false, 1)
+#endif

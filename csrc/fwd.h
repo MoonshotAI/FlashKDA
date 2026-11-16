@@ -3,7 +3,8 @@
 
 #include <cutlass/bfloat16.h>
 
-template <int D, bool HasStateIn = true, bool HasStateOut = true, bool StateFP32 = false, bool IsVarlen = true>
+template <int D, bool HasStateIn = true, bool HasStateOut = true, bool StateFP32 = false,
+          bool IsVarlen = true, bool UseV1A = false, int V1AEgress = 0>
 void launch_fwd(
     cutlass::bfloat16_t const* q_ptr,
     cutlass::bfloat16_t const* k_ptr,

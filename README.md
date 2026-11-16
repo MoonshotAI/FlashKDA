@@ -27,6 +27,34 @@ FLASH_KDA_CUDA_ARCHS=all pip install -v --no-build-isolation .
 
 Supported values are `auto` (default), `all`, or a comma-separated arch list such as `90a,100a`.
 
+### Optional SM103 K2 register state
+
+On SM103 (B300), build the V1a and V1aE specializations with:
+
+```bash
+FLASH_KDA_CUDA_ARCHS=103a FLASH_KDA_ENABLE_V1A=1 FLASH_KDA_ENABLE_V1AE=1 \
+  pip install -v --no-build-isolation .
+```
+
+`FLASH_KDA_ENABLE_V1A` enables persistent register state; `FLASH_KDA_ENABLE_V1AE`
+enables the same recurrence with a one-time shared-memory/TMA final-state store.
+Both flags default to off and may be enabled independently. The optimization
+changes recurrent-state dataflow, preserving the existing MMA math.
+
+Set `FLASH_KDA_K2_IMPL=auto` at runtime to select by workload, or use `baseline`,
+`v1a`, or `v1ae` explicitly. Unset defaults to `baseline`, even when both
+specializations are built. V1a/V1aE require SM103, fixed lengths, and both BF16
+`initial_state` and `final_state`. Unsupported or uncompiled explicit selections
+raise an error; `auto` falls back to baseline when its preferred path is unavailable.
+
+The H=64, B1–B8 thresholds in [`csrc/k2_dispatch.h`](csrc/k2_dispatch.h) are
+empirical B300 policy. For B5–B7, `>320` chunks selecting V1a is a conservative,
+unvalidated fallback, not a measured crossover. At H=64, B8 with `>=320` chunks
+and all B>8 workloads use baseline. For H!=64, supported calls use V1a at
+`>=128` chunks and baseline below that. A chunk is 16 tokens; the policy counts
+`ceil(T/16)` tiles per sequence, including a partial final tile. These thresholds
+are not claims for other GPUs.
+
 ## Using FlashKDA as an FLA backend
 
 Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chunk_kda`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.
@@ -67,6 +95,18 @@ Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chu
 
 See [BENCHMARK_H20.md](BENCHMARK_H20.md).
 
+After the SM103 build above, compare all four K2 selections on B1/T8192,
+B4/T2048, and B8/T1024 (H=64, D=128):
+
+```bash
+python benchmarks/bench_sm103_dispatch.py --warmup 30 --iters 200 --seed 42
+```
+
+The script uses identical seeded inputs, checks exact output/final-state equality
+and unchanged initial state, and prints mean/median CUDA-event latency in
+microseconds plus the expected AUTO selection. Timing calls the public
+`flash_kda.fwd` wrapper, including its workspace allocation; checks are untimed.
+
 ## Tests
 
 ```bash
@@ -74,6 +114,24 @@ bash tests/test.sh
 ```
 
 - `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
+
+Host-only K2 policy tests require Python and a C++17 GCC/Clang compiler, with
+no PyTorch or CUDA dependency (`CXX` may name the compiler executable):
+
+```bash
+python tests/test_k2_dispatch.py
+```
+
+The runner compiles into a temporary directory and also supports pytest.
+After building both specializations, opt into SM103 parity checks with:
+
+```bash
+FLASH_KDA_TEST_SM103=1 python -m pytest tests/test_sm103_k2.py -q
+```
+
+These GPU tests skip by default and on other architectures. Run the existing
+full regression separately under `FLASH_KDA_K2_IMPL=baseline` and `auto` using
+`python -m pytest tests/test_fwd_full.py -q`.
 
 
 ## Kernel API
