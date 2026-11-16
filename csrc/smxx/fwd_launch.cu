@@ -210,7 +210,7 @@ void launch_fwd(
             tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
+            out_ptr, T_total, H, N, cu_seqlens_ptr, ws_tile_prefix, total_tiles
         );
     }
 #endif

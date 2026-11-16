@@ -109,6 +109,52 @@ void fwd(
 
     TORCH_CHECK(D == 128, "currently only supports D == 128");
 
+    // Determine cu_seqlens and N before constructing any TMA descriptors. An
+    // all-empty varlen batch has T_total == 0, for which zero-extent TMA
+    // descriptors are invalid even though its recurrent-state semantics are
+    // well defined.
+    bool is_varlen = cu_seqlens.has_value();
+    int64_t N_val;
+    int64_t const* cu_seqlens_dev = nullptr;
+
+    if (is_varlen) {
+        TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
+        auto& cu_seqlens_t = cu_seqlens.value();
+        TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
+        TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
+        TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
+        N_val = cu_seqlens_t.numel() - 1;
+        TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
+        cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
+    } else {
+        N_val = B;
+    }
+
+    // Validate state shapes: always [N, H, D, D]
+    if (has_state_in) {
+        auto& is = initial_state.value();
+        TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
+        TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
+                     "initial_state must be [N, H, D, D]");
+    }
+    if (has_state_out) {
+        auto& fs = final_state.value();
+        TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
+        TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
+                     "final_state must be [N, H, D, D]");
+    }
+
+    if (T_total == 0) {
+        if (has_state_out) {
+            if (has_state_in) {
+                final_state->copy_(initial_state.value());
+            } else {
+                final_state->zero_();
+            }
+        }
+        return;
+    }
+
     // Flatten [B, T, H, D] -> [B*T, H, D] (contiguous, same data pointer)
     auto q_3d = q.reshape({T_total, H, D});
     auto k_3d = k.reshape({T_total, H, D});
@@ -140,38 +186,6 @@ void fwd(
     // Get state pointers (nullptr if not present)
     void const* initial_state_raw = has_state_in ? initial_state->data_ptr() : nullptr;
     void* final_state_raw = has_state_out ? final_state->data_ptr() : nullptr;
-
-    // Determine cu_seqlens and N
-    bool is_varlen = cu_seqlens.has_value();
-    int64_t N_val;
-    int64_t const* cu_seqlens_dev = nullptr;
-
-    if (is_varlen) {
-        TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
-        auto& cu_seqlens_t = cu_seqlens.value();
-        TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
-        TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
-        TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
-        N_val = cu_seqlens_t.numel() - 1;
-        TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-        cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
-    } else {
-        N_val = B;
-    }
-
-    // Validate state shapes: always [N, H, D, D]
-    if (has_state_in) {
-        auto& is = initial_state.value();
-        TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
-        TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
-                     "initial_state must be [N, H, D, D]");
-    }
-    if (has_state_out) {
-        auto& fs = final_state.value();
-        TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
-        TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
-                     "final_state must be [N, H, D, D]");
-    }
 
     int total_tiles;
     if (is_varlen) {
