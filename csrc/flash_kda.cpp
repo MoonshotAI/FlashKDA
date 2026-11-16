@@ -39,7 +39,8 @@ void fwd(
     double lower_bound,
     std::optional<torch::Tensor> initial_state = std::nullopt,
     std::optional<torch::Tensor> final_state = std::nullopt,
-    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+    std::optional<torch::Tensor> cu_seqlens = std::nullopt,
+    std::optional<torch::Tensor> intermediate_state = std::nullopt
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
@@ -57,6 +58,7 @@ void fwd(
     bool has_state_in = initial_state.has_value();
     bool has_state_out = final_state.has_value();
     bool state_fp32 = false;
+    bool has_intermediate_state = intermediate_state.has_value();
 
     if (has_state_in) {
         auto& is = initial_state.value();
@@ -150,6 +152,9 @@ void fwd(
         TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
         TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
+        TORCH_CHECK(cu_seqlens_t.device() == q.device(),
+                    "cu_seqlens must be on the same CUDA device as q");
+        TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
         TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
         TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
@@ -180,36 +185,60 @@ void fwd(
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
     }
 
+    if (has_intermediate_state) {
+        auto& ims = intermediate_state.value();
+        TORCH_CHECK(ims.is_cuda() && ims.is_contiguous(),
+                    "intermediate_state must be a contiguous CUDA tensor");
+        TORCH_CHECK(ims.device() == q.device(),
+                    "intermediate_state must be on the same CUDA device as q");
+        TORCH_CHECK(ims.dtype() == torch::kBFloat16,
+                    "intermediate_state must be bfloat16");
+        TORCH_CHECK(ims.dim() == 4 && ims.size(0) == H &&
+                    ims.size(1) == total_tiles && ims.size(2) == D && ims.size(3) == D,
+                    "intermediate_state must be [H, total_tiles, D, D]");
+    }
+    auto intermediate_state_ptr = has_intermediate_state
+        ? reinterpret_cast<cutlass::bfloat16_t*>(intermediate_state->data_ptr<at::BFloat16>())
+        : nullptr;
+
     // Dispatch based on state configuration and varlen
-    #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
+    #define LAUNCH(HI, HO, FP32, HIS, VL) \
+        launch_fwd<128, HI, HO, FP32, HIS, VL>( \
             q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
-            initial_state_raw, scale_f, final_state_raw, out_ptr, \
+            initial_state_raw, scale_f, final_state_raw, intermediate_state_ptr, out_ptr, \
             workspace_ptr, total_tiles, \
             int(T_total), int(H), int(N_val), cu_seqlens_dev, \
             A_log_ptr, dt_bias_ptr, gate_scale, stream)
 
-    #define DISPATCH_STATE(VL) \
+    #define DISPATCH_STATE(HIS, VL) \
         if (!has_state_in && !has_state_out) { \
-            LAUNCH(false, false, false, VL); \
+            LAUNCH(false, false, false, HIS, VL); \
         } else if (has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(true, true, true, VL); \
+            LAUNCH(true, true, true, HIS, VL); \
         } else if (has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(true, true, false, VL); \
+            LAUNCH(true, true, false, HIS, VL); \
         } else if (!has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(false, true, true, VL); \
+            LAUNCH(false, true, true, HIS, VL); \
         } else if (!has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(false, true, false, VL); \
+            LAUNCH(false, true, false, HIS, VL); \
         } else if (has_state_in && !has_state_out && state_fp32) { \
-            LAUNCH(true, false, true, VL); \
+            LAUNCH(true, false, true, HIS, VL); \
         } else { \
-            LAUNCH(true, false, false, VL); \
+            LAUNCH(true, false, false, HIS, VL); \
         }
 
-    if (is_varlen) {
-        DISPATCH_STATE(true);
+    if (has_intermediate_state) {
+        if (is_varlen) {
+            DISPATCH_STATE(true, true);
+        } else {
+            DISPATCH_STATE(true, false);
+        }
     } else {
-        DISPATCH_STATE(false);
+        if (is_varlen) {
+            DISPATCH_STATE(false, true);
+        } else {
+            DISPATCH_STATE(false, false);
+        }
     }
 
     #undef DISPATCH_STATE
@@ -223,7 +252,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace"),
         py::arg("A_log"), py::arg("dt_bias"), py::arg("lower_bound"),
         py::arg("initial_state") = py::none(), py::arg("final_state") = py::none(),
-        py::arg("cu_seqlens") = py::none());
+        py::arg("cu_seqlens") = py::none(),
+        py::arg("intermediate_state") = py::none());
     m.def("get_workspace_size",
         static_cast<int64_t(*)(int64_t, int64_t, int64_t)>(&get_workspace_size),
         "Get workspace size in bytes",

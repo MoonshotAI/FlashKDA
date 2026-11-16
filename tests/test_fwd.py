@@ -424,6 +424,140 @@ def test_fwd_varlen_vs_fla():
     print("Assert results: Success")
 
 
+def test_fwd_intermediate_state_varlen():
+    """Each ragged chunk snapshot must exactly match the reference recurrence."""
+    H, D = 2, 128
+    LOWER_BOUND = -5.0
+    seq_lens = [17, 33, 65]
+    T_total = sum(seq_lens)
+    N = len(seq_lens)
+    valid_tiles = sum((seq_len + 15) // 16 for seq_len in seq_lens)
+    cu_seqlens = torch.tensor([0, 17, 50, 115], dtype=torch.long, device="cuda")
+
+    torch.manual_seed(17)
+    shape = (1, T_total, H, D)
+    q = F.normalize(torch.randn(shape, dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn(shape, dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    g = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    beta = torch.randn((1, T_total, H), dtype=torch.bfloat16, device="cuda")
+    A_log = torch.rand(H, dtype=torch.float32, device="cuda")
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device="cuda")
+    initial_state = torch.randn((N, H, D, D), dtype=torch.bfloat16, device="cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    snapshot_shape = flash_kda.get_intermediate_state_shape(q, cu_seqlens)
+    tile_prefix = flash_kda.get_intermediate_state_tile_prefix(q, cu_seqlens)
+    assert snapshot_shape == (H, 11, D, D)
+    assert torch.equal(tile_prefix, torch.tensor([0, 2, 5, 10], device="cuda"))
+    intermediate_state = torch.full(snapshot_shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+    intermediate_state_ref = torch.full_like(intermediate_state, float("nan"))
+    out_kernel = torch.zeros_like(q)
+    out_ref = torch.zeros_like(q)
+
+    flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  initial_state=initial_state.clone(), cu_seqlens=cu_seqlens,
+                  intermediate_state=intermediate_state)
+    torch.cuda.synchronize()
+    torch_ref(q, k, v, g, beta, scale, out_ref,
+              A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+              initial_state=initial_state.clone(), cu_seqlens=cu_seqlens,
+              intermediate_state=intermediate_state_ref)
+
+    # The unmodified SM90 kernel differs from the torch reference by one BF16
+    # ULP on this ragged input, so allow that established output tolerance while
+    # retaining an exact check for the new chunk-state ABI below.
+    torch.testing.assert_close(out_kernel, out_ref, rtol=1e-2, atol=1e-7)
+    assert torch.equal(intermediate_state[:, :valid_tiles],
+                       intermediate_state_ref[:, :valid_tiles]), "varlen chunk state mismatch"
+    assert torch.isnan(intermediate_state[:, valid_tiles:]).all(), "unused ragged capacity was modified"
+
+    # Kernel-side raw indexing must reject strided CUDA views.
+    strided_source = torch.empty(cu_seqlens.numel() * 2 - 1, dtype=torch.long, device="cuda")
+    strided_source[::2] = cu_seqlens
+    strided_source[1::2] = 0
+    noncontiguous_cu_seqlens = strided_source[::2]
+    assert not noncontiguous_cu_seqlens.is_contiguous()
+    try:
+        flash_kda.fwd(q, k, v, g, beta, scale, torch.zeros_like(q),
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      initial_state=initial_state.clone(),
+                      cu_seqlens=noncontiguous_cu_seqlens,
+                      intermediate_state=torch.empty(snapshot_shape, dtype=torch.bfloat16, device="cuda"))
+    except RuntimeError as exc:
+        assert "cu_seqlens must be contiguous" in str(exc)
+    else:
+        raise AssertionError("non-contiguous cu_seqlens was accepted")
+
+
+def test_fwd_intermediate_state_batched():
+    """Snapshot dispatch also supports batched fixed-length sequences."""
+    B, T, H, D = 2, 17, 2, 128
+    LOWER_BOUND = -5.0
+    torch.manual_seed(23)
+    shape = (B, T, H, D)
+    q = F.normalize(torch.randn(shape, dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn(shape, dtype=torch.float32, device="cuda"), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    g = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    beta = torch.randn((B, T, H), dtype=torch.bfloat16, device="cuda")
+    A_log = torch.rand(H, dtype=torch.float32, device="cuda")
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device="cuda")
+    initial_state = torch.randn((B, H, D, D), dtype=torch.bfloat16, device="cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    intermediate_state = torch.empty(flash_kda.get_intermediate_state_shape(q),
+                                     dtype=torch.bfloat16, device="cuda")
+    intermediate_state_ref = torch.empty_like(intermediate_state)
+    out_kernel = torch.zeros_like(q)
+    out_ref = torch.zeros_like(q)
+
+    flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  initial_state=initial_state.clone(), intermediate_state=intermediate_state)
+    torch.cuda.synchronize()
+    torch_ref(q, k, v, g, beta, scale, out_ref,
+              A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+              initial_state=initial_state.clone(), intermediate_state=intermediate_state_ref)
+
+    assert torch.equal(out_kernel, out_ref), "batched output mismatch"
+    assert torch.equal(intermediate_state, intermediate_state_ref), "batched chunk state mismatch"
+
+    # Exercise the remaining HasIntermediateState dispatches permanently.
+    state_variants = [
+        ("no-state", None, None),
+        ("bf16-in", torch.randn((B, H, D, D), dtype=torch.bfloat16, device="cuda"), None),
+        ("bf16-final", None, torch.empty((B, H, D, D), dtype=torch.bfloat16, device="cuda")),
+        ("bf16-in-out", torch.randn((B, H, D, D), dtype=torch.bfloat16, device="cuda"),
+         torch.empty((B, H, D, D), dtype=torch.bfloat16, device="cuda")),
+        ("fp32-in", torch.randn((B, H, D, D), dtype=torch.float32, device="cuda"), None),
+        ("fp32-final", None, torch.empty((B, H, D, D), dtype=torch.float32, device="cuda")),
+        ("fp32-in-out", torch.randn((B, H, D, D), dtype=torch.float32, device="cuda"),
+         torch.empty((B, H, D, D), dtype=torch.float32, device="cuda")),
+    ]
+    for label, state_in, state_out in state_variants:
+        final_kernel = torch.empty_like(state_out) if state_out is not None else None
+        final_ref = torch.empty_like(state_out) if state_out is not None else None
+        snapshot_kernel = torch.empty_like(intermediate_state)
+        snapshot_ref = torch.empty_like(intermediate_state)
+        out_kernel = torch.zeros_like(q)
+        out_ref = torch.zeros_like(q)
+        flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                      initial_state=state_in, final_state=final_kernel,
+                      intermediate_state=snapshot_kernel)
+        torch.cuda.synchronize()
+        torch_ref(q, k, v, g, beta, scale, out_ref,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+                  initial_state=state_in, final_state=final_ref,
+                  intermediate_state=snapshot_ref)
+        assert torch.equal(out_kernel, out_ref), f"{label} output mismatch"
+        assert torch.equal(snapshot_kernel, snapshot_ref), f"{label} chunk state mismatch"
+        if state_out is not None:
+            assert torch.equal(final_kernel, final_ref), f"{label} final state mismatch"
+
+
 if __name__ == "__main__":
     test_fwd()
     test_fwd_varlen()
