@@ -41,10 +41,14 @@ void fwd(
     std::optional<torch::Tensor> final_state = std::nullopt,
     std::optional<torch::Tensor> cu_seqlens = std::nullopt
 ) {
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
-                "all tensors must be on CUDA");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
-                "all tensors must be contiguous");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda(),
+                "all input and output tensors must be on CUDA");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && out.is_contiguous(),
+                "all input and output tensors must be contiguous");
+    TORCH_CHECK(workspace.is_cuda(), "workspace must be a CUDA tensor");
+    TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
+    TORCH_CHECK(workspace.dtype() == torch::kUInt8, "workspace must have dtype uint8");
+    TORCH_CHECK(workspace.device() == q.device(), "workspace must be on the same device as q");
 
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
@@ -158,6 +162,12 @@ void fwd(
     } else {
         N_val = B;
     }
+
+    int64_t required_workspace_bytes = get_workspace_size(T_total, H, N_val);
+    TORCH_CHECK(
+        workspace.numel() >= required_workspace_bytes,
+        "workspace is too small: expected at least ", required_workspace_bytes,
+        " bytes, but got ", workspace.numel());
 
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {
