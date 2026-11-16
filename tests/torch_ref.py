@@ -2,27 +2,28 @@ import torch
 from torch.utils.cpp_extension import load_inline
 
 # ============================================================
-# sigmoid via tanh.approx.f32: tanh(x*0.5)*0.5+0.5
+# Sigmoid with the same approximate exp2 and reciprocal as the kernel.
 # ============================================================
 _sigmoid_cuda_src = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 
-__global__ void sigmoid_tanh_fp32_kernel(const float* __restrict__ input,
-                                         float* __restrict__ output, int n) {
+__global__ void sigmoid_fp32_kernel(const float* __restrict__ input,
+                                    float* __restrict__ output, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float xh = input[idx] * 0.5f;
-        float th;
-        asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(xh));
-        output[idx] = th * 0.5f + 0.5f;
+        float exponent, result, x = -input[idx] * 1.4426950408889634f;
+        asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponent) : "f"(x));
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(1.0f + exponent));
+        output[idx] = result;
     }
 }
 
-torch::Tensor sigmoid_tanh_fp32(torch::Tensor input) {
+torch::Tensor sigmoid_fp32(torch::Tensor input) {
     auto output = torch::empty_like(input);
     int n = input.numel();
-    sigmoid_tanh_fp32_kernel<<<(n + 255) / 256, 256>>>(
+    sigmoid_fp32_kernel<<<(n + 255) / 256, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
         input.data_ptr<float>(), output.data_ptr<float>(), n);
     return output;
 }
@@ -30,9 +31,9 @@ torch::Tensor sigmoid_tanh_fp32(torch::Tensor input) {
 
 sigmoid_ext = load_inline(
     name='sigmoid_ext',
-    cpp_sources='torch::Tensor sigmoid_tanh_fp32(torch::Tensor input);',
+    cpp_sources='torch::Tensor sigmoid_fp32(torch::Tensor input);',
     cuda_sources=_sigmoid_cuda_src,
-    functions=['sigmoid_tanh_fp32'],
+    functions=['sigmoid_fp32'],
     extra_cuda_cflags=['-O2'],
     verbose=False,
 )
@@ -75,7 +76,7 @@ def l2_normalize_kernel_match(x):
         partials = partials + partials[..., indices]
 
     inv_norm = torch.rsqrt(partials[..., 0:1] + 1e-6)
-    return (x_f32 * inv_norm).to(x.dtype)
+    return x_f32 * inv_norm
 
 
 # ============================================================
@@ -134,7 +135,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     initial_state/final_state can be:
       - None: no state (zero-init / skip store)
       - bf16 tensor: [N, H, D, D]
-      - fp32 tensor: [N, H, D, D] (converted to bf16 for compute, back to fp32 for output)
+      - fp32 tensor: [N, H, D, D] (FP32 carry with a BF16 view for MMA)
     """
     assert q.dim() == 4, f"Expected 4D input [B, T, H, D], got {q.dim()}D"
     B = q.shape[0]
@@ -153,7 +154,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     _, H, D = q.shape
     CHUNK = 16
     device = q.device
-    scale_bf16 = torch.tensor(scale, dtype=torch.bfloat16, device=device)
+    output_scale = torch.tensor(scale, dtype=torch.float32, device=device)
 
     q = l2_normalize_kernel_match(q)
     k = l2_normalize_kernel_match(k)
@@ -166,10 +167,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
         g = g.to(torch.float32) + dt_bias.unsqueeze(0)
         a_log_exp = fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
         scale = lower_bound * LOG2E
-        g = scale * sigmoid_ext.sigmoid_tanh_fp32(a_log_exp * g)
-
-    state_fp32 = (initial_state is not None and initial_state.dtype == torch.float32) or \
-                 (final_state is not None and final_state.dtype == torch.float32)
+        g = scale * sigmoid_ext.sigmoid_fp32(a_log_exp * g)
 
     if cu_seqlens is None:
         T = q.shape[0]
@@ -178,9 +176,9 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     N = len(cu_seqlens) - 1
 
     if initial_state is not None:
-        work_state = initial_state.to(torch.bfloat16).clone()
+        work_state = initial_state.to(torch.float32).clone()
     else:
-        work_state = torch.zeros(N, H, D, D, dtype=torch.bfloat16, device=device)
+        work_state = torch.zeros(N, H, D, D, dtype=torch.float32, device=device)
 
     for seq_idx in range(N):
         bos = cu_seqlens[seq_idx].item()
@@ -207,41 +205,42 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
 
                 g_cumsum = g_chunk.cumsum(dim=0)
                 g_total = g_cumsum[-1:]
-                k_decayed = k_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
-                q_decayed = q_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16) * scale_bf16
-                neg_g_cumsum_bf16 = fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
-                k_inv = k_chunk * neg_g_cumsum_bf16
-                g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
-                k_restored = k_inv * g_total_exp_bf16
+                decay = fp32_ex2_ftz(g_cumsum)
+                k_decayed = (k_chunk * decay).to(torch.bfloat16)
+                q_decayed = (q_chunk * decay * output_scale).to(torch.bfloat16)
+                k_inv_fp32 = k_chunk * fp32_ex2_ftz(-g_cumsum)
+                k_inv = k_inv_fp32.to(torch.bfloat16)
+                k_restored = (k_inv_fp32 * fp32_ex2_ftz(g_total)).to(torch.bfloat16)
                 L = torch.mm(k_decayed, k_inv.t(), out_dtype=torch.float32)
                 Mqk = torch.matmul(q_decayed, k_inv.t())
 
-                # Fuse sigmoid via tanh.approx: beta is bf16 logits
-                beta_activated = sigmoid_ext.sigmoid_tanh_fp32(beta_chunk.to(torch.float32))
-                beta_val_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
+                beta_activated = sigmoid_ext.sigmoid_fp32(beta_chunk.to(torch.float32))
                 L = torch.tril(L, diagonal=-1) * beta_activated.unsqueeze(-1)
                 Mqk = torch.tril(Mqk)
 
                 INV = inv_fwd_subst_16(L)
 
                 state_slice = work_state[seq_idx, h]
-                v_chunk = v_chunk - torch.matmul(k_decayed, state_slice.t())
-                v_chunk = v_chunk * beta_val_bf16
+                state_bf16 = state_slice.to(torch.bfloat16)
+                residual = v_chunk.float() - torch.mm(k_decayed, state_bf16.t(), out_dtype=torch.float32)
+                v_chunk = (residual * beta_activated.unsqueeze(-1)).to(torch.bfloat16)
 
                 U = torch.matmul(INV, v_chunk)
-                _out = torch.matmul(q_decayed, state_slice.t())
-                _out = _out + torch.matmul(Mqk, U)
+                # One GEMM continues q @ state's FP32 accumulation with Mqk @ U.
+                # Two GEMMs followed by addition round differently.
+                _out = torch.mm(
+                    torch.cat([q_decayed, Mqk], dim=1),
+                    torch.cat([state_bf16.t(), U], dim=0),
+                    out_dtype=torch.float32,
+                )
 
                 delta_s = torch.mm(k_restored.t(), U, out_dtype=torch.float32)
 
                 g_total_exp = fp32_ex2_ftz(g_total)
                 g_total_exp = g_total_exp.squeeze(0).unsqueeze(-1)
-                work_state[seq_idx, h] = fp32_fma(delta_s, state_slice.to(torch.float32).t(), g_total_exp).to(torch.bfloat16).t()
+                work_state[seq_idx, h] = fp32_fma(delta_s, state_slice.t(), g_total_exp).t()
 
                 out[t0:t0 + actual_len, h] = _out[:actual_len]
 
     if final_state is not None:
-        if state_fp32:
-            final_state.copy_(work_state.to(torch.float32))
-        else:
-            final_state.copy_(work_state)
+        final_state.copy_(work_state)

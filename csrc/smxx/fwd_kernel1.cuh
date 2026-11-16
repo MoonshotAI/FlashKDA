@@ -70,6 +70,8 @@ struct SharedStorageK1 {
         };
     };
 
+    alignas(128) cute::ArrayEngine<float, cute::size<0>(QKLayout{})> q_norm;
+    alignas(128) cute::ArrayEngine<float, cute::size<0>(QKLayout{})> k_norm;
     alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<BetaSmemLayout>> beta;
 
     union {
@@ -262,7 +264,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
 
-    // --- QK L2 Normalization ---
+    // Keep normalization scales in FP32 and round only the gated MMA operands.
     int compute_tid = threadIdx.x;
     {
         constexpr int ELEMS_PER_THREAD = 8;
@@ -273,15 +275,12 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         BF16* q_smem = shared_storage.q.begin();
         BF16* k_smem = shared_storage.k.begin();
 
-        float q_vals[ELEMS_PER_THREAD], k_vals[ELEMS_PER_THREAD];
         float q_sq = 0.0f, k_sq = 0.0f;
 
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
             float qv = bf16_to_f32(q_smem[my_row * D + my_col + i]);
             float kv = bf16_to_f32(k_smem[my_row * D + my_col + i]);
-            q_vals[i] = qv;
-            k_vals[i] = kv;
             q_sq += qv * qv;
             k_sq += kv * kv;
         }
@@ -295,10 +294,9 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         float q_inv = rsqrtf(q_sq + 1e-6f);
         float k_inv = rsqrtf(k_sq + 1e-6f);
 
-        #pragma unroll
-        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-            q_smem[my_row * D + my_col + i] = BF16(q_vals[i] * q_inv);
-            k_smem[my_row * D + my_col + i] = BF16(k_vals[i] * k_inv);
+        if (my_col == 0) {
+            shared_storage.q_norm.begin()[my_row] = q_inv;
+            shared_storage.k_norm.begin()[my_row] = k_inv;
         }
     }
     __syncthreads();
@@ -320,7 +318,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 if (row < actual_len) {
                     g_val = bf16_to_f32(g_bf16_smem[row * D + col]) + dt;
                     g_val = a_log_exp * g_val;
-                    g_val = gate_scale * sigmoid_tanh_approx_f32(g_val);
+                    g_val = gate_scale * sigmoid_approx_f32(g_val);
                 } else {
                     g_val = 0.0f;
                 }
@@ -448,11 +446,11 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[tile_idx][v];
-                    BF16 q = reg_q[tile_idx][v];
-                    BF16 k = reg_k[tile_idx][v];
-                    BF16 exp_cumsum = BF16(ex2_approx_ftz_f32(g));
-                    r_qd(0, v) = q * exp_cumsum * BF16(scale);
-                    r_kd(0, v) = k * exp_cumsum;
+                    float q = float(reg_q[tile_idx][v]) * shared_storage.q_norm.begin()[row];
+                    float k = float(reg_k[tile_idx][v]) * shared_storage.k_norm.begin()[row];
+                    float exp_cumsum = ex2_approx_ftz_f32(g);
+                    r_qd(0, v) = BF16(float(q) * exp_cumsum * scale);
+                    r_kd(0, v) = BF16(float(k) * exp_cumsum);
                 }
                 cute::copy(AutoVectorizingCopy{}, r_qd, s_qd);
                 cute::copy(AutoVectorizingCopy{}, r_kd, s_kd);
@@ -462,10 +460,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[tile_idx][v];
-                    BF16 k = reg_k[tile_idx][v];
-                    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
-                    r_ki(0, v) = k * inv_cumsum;
-                    r_kr(0, v) = k * inv_cumsum * BF16(reg_gt[tile_idx][v]);
+                    float k = float(reg_k[tile_idx][v]) * shared_storage.k_norm.begin()[row];
+                    float inv_cumsum = ex2_approx_ftz_f32(-g);
+                    r_ki(0, v) = BF16(float(k) * inv_cumsum);
+                    r_kr(0, v) = BF16(float(k) * inv_cumsum * reg_gt[tile_idx][v]);
                 }
                 cute::copy(AutoVectorizingCopy{}, r_ki, s_ki);
                 cute::copy(AutoVectorizingCopy{}, r_kr, s_kr);
@@ -499,7 +497,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         if (i <= j) {
             L_fp32(i, j) = 0.0f;
         } else {
-            L_fp32(i, j) = L_fp32(i, j) * sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + i)));
+            L_fp32(i, j) = L_fp32(i, j) * sigmoid_approx_f32(float(beta_tile(beta_smem_offset + i)));
         }
         if (i < j) {
             Mqk(i, j) = BF16::bitcast(0);

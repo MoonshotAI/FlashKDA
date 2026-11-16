@@ -44,27 +44,12 @@ end-to-end speedup and made each stage independently tunable.
 
 ## 3. Numerical Precision
 
-FlashKDA stores the on-chip recurrent state in **bf16**. This cuts the shared
-memory footprint of the state roughly in half and removes the `fp32 → bf16`
-cast that would otherwise sit on the critical path of every bf16 GEMM feeding
-the state.
-
-We validated this choice with extensive internal testing. As long as the
-state update itself is performed with `fp32` FMA instructions, storing the
-accumulator in bf16 between updates introduces no measurable accuracy loss
-across our inference benchmarks.
-
-Several other precision-aware decisions appear inside the kernel:
-
-- **Sigmoid via `tanh.approx.f32`.** We implement sigmoid using the PTX
-  `tanh.approx.f32` instruction, which is both faster and precise enough for
-  the gating path.
-- **Forward-substitution matrix inversion.** The `16 × 16` inverse is computed
-  exactly: the seed `L` stays in fp32 end to end (the `L` GEMM stores its raw
-  fp32 accumulator and the tril/beta masking is done in fp32), the two diagonal
-  `8 × 8` blocks are inverted by fp32 forward substitution, and the
-  off-diagonal block is merged with two bf16-HMMA GEMMs (`dc = P @ M`,
-  `o = (−dc) @ P`, both fp32-accumulate).
+**Forward-substitution matrix inversion.** The `16 × 16` inverse is computed
+exactly: the seed `L` stays in fp32 end to end (the `L` GEMM stores its raw
+fp32 accumulator and the tril/beta masking is done in fp32), the two diagonal
+`8 × 8` blocks are inverted by fp32 forward substitution, and the
+off-diagonal block is merged with two bf16-HMMA GEMMs (`dc = P @ M`,
+`o = (−dc) @ P`, both fp32-accumulate).
 
 ### Accuracy vs. `fla_chunk_kda`
 

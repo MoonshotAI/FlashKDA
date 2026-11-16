@@ -62,6 +62,10 @@ struct K2Layouts {
         make_shape(Int<D>{}, Int<D>{}),
         LayoutLeft{}
     ));
+    using TransposedFP32StateSmemLayout = decltype(composition(
+        FP32StateSmemLayout{},
+        make_layout(make_shape(Int<D>{}, Int<D>{}), GenRowMajor{})
+    ));
     using TMAFP32StateSmemLayout = decltype(composition(
         FP32StateSmemLayout{}.layout_a(),
         FP32StateSmemLayout{}.offset(),
@@ -317,8 +321,37 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     }
 #endif
 
+    auto mma = make_tiled_mma(
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
+        Layout<Shape<_1,_1>>{},
+        Tile<_16,_16,_16>{}
+    );
+    ThrMMA thr_mma = mma.get_slice(threadIdx.x % kWarpSize);
+    using AccFragT = decltype(partition_fragment_C(mma, make_shape(_16{}, _16{})));
+
+    // [key block][value block], with each carry using the MMA C-fragment layout.
+    AccFragT state_regs[D / 16][2];
 #ifndef TMA_DISABLE_ALL
     __syncthreads();
+    if (threadIdx.x < kComputeThreads) {
+        // State IO is [value, key]; the update MMA's C operand is [key, value].
+        auto initial_T = [&] {
+            if constexpr (HasStateIn && StateFP32)
+                return make_tensor(make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
+                    typename Layouts::TransposedFP32StateSmemLayout{});
+            else
+                return make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TransposedStateSmemLayout{});
+        }();
+        #pragma unroll
+        for (int m = 0; m < D / 16; ++m)
+            #pragma unroll
+            for (int bi = 0; bi < 2; ++bi) {
+                auto block = local_tile(initial_T, make_shape(_16{}, _16{}), make_coord(m, warp_id * 2 + bi));
+                cute::transform(thr_mma.partition_C(block), state_regs[m][bi],
+                    [] __device__ (auto x) { return float(x); });
+            }
+    }
+    __syncthreads();  // all initial-state reads finish before pipeline reuse
 
     // --- LOAD warp: issue TMA loads for v, beta, and workspace intermediates
     if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
@@ -465,17 +498,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             constexpr int PREFETCH = 1;
 
-            auto mma = make_tiled_mma(
-                MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
-                Layout<Shape<_1,_1>>{},
-                Tile<_16,_16,_16>{}
-            );
-
             const int warp_id = compute_tid / 32;
             const int lane_id = compute_tid % 32;
             const int group_id = (lane_id / 4) % 8;
-
-            ThrMMA thr_mma = mma.get_slice(lane_id);
 
             // A copy: K_INTER → LDSM_N (for k_decayed, q_decayed, INV, Mqk)
             auto smem_tiled_copy_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, BF16>{}, mma);
@@ -495,9 +520,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             auto smem_tiled_store_C = make_tiled_copy_C(Copy_Atom<SM90_U32x4_STSM_N, BF16>{}, mma);
             auto smem_thr_store_C   = smem_tiled_store_C.get_slice(lane_id);
 
-            // C load/store transposed (for Phase 6 state access via s_acc_T)
-            auto smem_tiled_load_C_T  = make_tiled_copy_C(Copy_Atom<SM75_U16x8_LDSM_T, BF16>{}, mma);
-            auto smem_thr_load_C_T    = smem_tiled_load_C_T.get_slice(lane_id);
+            // Store the BF16 MMA view; the FP32 carry stays in lane-owned registers.
             auto smem_tiled_store_C_T = make_tiled_copy_C(Copy_Atom<SM90_U16x8_STSM_T, BF16>{}, mma);
             auto smem_thr_store_C_T   = smem_tiled_store_C_T.get_slice(lane_id);
 
@@ -519,7 +542,6 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             auto tCrC_ref = thr_mma.partition_C(C_ref);
 
-            using AccFragT = decltype(thr_mma.make_fragment_C(tCrC_ref));
             using SFragT = decltype(make_fragment_like<BF16>(thr_mma.make_fragment_C(tCrC_ref)));
             using AFragT = decltype(thr_mma.partition_fragment_A(A_ref));
             using BFragT_u = decltype(thr_mma.partition_fragment_B(B_ref));
@@ -567,11 +589,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 gemm(thr_mma, tCrA_q(_,_,Int<0>{}), tCrB(_,_,Int<0>{}), out_acc[1]);
             }
 
-            // ======== Phase 2: Cast out (keep in regs), load v/INV/beta ========
+            // ======== Phase 2: Keep FP32 output, load v/INV/beta ========
             SFragT out_bf16[2];
-            #pragma unroll
-            for (int i = 0; i < 2; ++i)
-                cute::transform(out_acc[i], out_bf16[i], [] __device__ (float x) { return BF16(x); });
 
             SFragT v_bf16[2];
             #pragma unroll
@@ -583,8 +602,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
 
-            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
-            BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
+            float beta0 = sigmoid_approx_f32(float(beta_tile(beta_smem_offset + group_id)));
+            float beta1 = sigmoid_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8)));
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
             SFragT u_bf16[2];
@@ -592,16 +611,14 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             #pragma unroll
             for (int i = 0; i < 2; ++i) {
-                cute::transform(u_acc[i], u_bf16[i], [] __device__ (float x) { return BF16(x); });
-
                 #pragma unroll
                 for (int a = 0; a < 2; ++a) {
                     #pragma unroll
                     for (int d = 0; d < 2; ++d) {
                         auto c0 = make_coord(make_coord(a, 0), 0, d);
                         auto c1 = make_coord(make_coord(a, 1), 0, d);
-                        u_bf16[i](c0) = (v_bf16[i](c0) - u_bf16[i](c0)) * beta0;
-                        u_bf16[i](c1) = (v_bf16[i](c1) - u_bf16[i](c1)) * beta1;
+                        u_bf16[i](c0) = BF16((float(v_bf16[i](c0)) - u_acc[i](c0)) * beta0);
+                        u_bf16[i](c1) = BF16((float(v_bf16[i](c1)) - u_acc[i](c1)) * beta1);
                     }
                 }
 
@@ -641,12 +658,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 b_dst[0] = u_b_regs[0]; b_dst[1] = u_b_regs[1];
                 b_dst[2] = u_b_regs[2]; b_dst[3] = u_b_regs[3];
 
-                clear(out_acc[i]);
                 gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_arr[i](_,_,Int<0>{}), out_acc[i]);
-
-                SFragT gemm_bf16;
-                cute::transform(out_acc[i], gemm_bf16, [] __device__ (float x) { return BF16(x); });
-                cute::transform(out_bf16[i], gemm_bf16, out_bf16[i], [] __device__ (BF16 c, BF16 a) { return c + a; });
+                cute::transform(out_acc[i], out_bf16[i], [] __device__ (float x) { return BF16(x); });
             }
 
             // ======== Phase 5: Store final out ========
@@ -666,7 +679,6 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             auto tCrAi_kr_view = smem_thr_copy_A_T.retile_D(tCrAi_kr);
 
             AFragT ring_A_kr[PREFETCH];
-            SFragT ring_S_acc[2][PREFETCH];
             float ring_g0[PREFETCH], ring_g1[PREFETCH];
 
             #pragma unroll
@@ -674,12 +686,6 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 Tensor kr_block = local_tile(k_restored_t, make_shape(Int<16>{}, Int<16>{}), make_coord(i, 0));
                 copy(smem_tiled_copy_A_T, smem_thr_copy_A_T.partition_S(kr_block), tCrAi_kr_view);
                 cute::transform(tCrAi_kr, ring_A_kr[i], cute::identity{});
-
-                #pragma unroll
-                for (int bi = 0; bi < 2; ++bi) {
-                    Tensor s_block = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(i, warp_id * 2 + bi));
-                    copy(smem_tiled_load_C_T, smem_thr_load_C_T.partition_S(s_block), smem_thr_load_C_T.retile_D(ring_S_acc[bi][i]));
-                }
 
                 ring_g0[i] = g_total(i * 16 + group_id);
                 ring_g1[i] = g_total(i * 16 + group_id + 8);
@@ -709,24 +715,16 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
                 #pragma unroll
                 for (int bi = 0; bi < 2; ++bi) {
+                    SFragT rounded;
                     #pragma unroll
-                    for (int a = 0; a < 2; ++a) {
-                        #pragma unroll
-                        for (int d = 0; d < 2; ++d) {
-                            auto c0 = make_coord(make_coord(a, 0), 0, d);
-                            auto c1 = make_coord(make_coord(a, 1), 0, d);
-                            ring_S_acc[bi][slot](c0) = BF16(bf16_to_f32(ring_S_acc[bi][slot](c0)) * g0 + u_acc[bi](c0));
-                            ring_S_acc[bi][slot](c1) = BF16(bf16_to_f32(ring_S_acc[bi][slot](c1)) * g1 + u_acc[bi](c1));
-                        }
+                    for (int j = 0; j < 8; ++j) {
+                        float decay = (j / 2 % 2) ? g1 : g0;
+                        state_regs[m][bi](j) = fmaf(state_regs[m][bi](j), decay, u_acc[bi](j));
+                        rounded(j) = BF16(state_regs[m][bi](j));
                     }
-
                     Tensor s_block = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(m, warp_id * 2 + bi));
-                    copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(ring_S_acc[bi][slot]), smem_thr_store_C_T.partition_D(s_block));
+                    copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(rounded), smem_thr_store_C_T.partition_D(s_block));
 
-                    if (m + PREFETCH < S_M_BLOCKS) {
-                        Tensor s_next = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(m + PREFETCH, warp_id * 2 + bi));
-                        copy(smem_tiled_load_C_T, smem_thr_load_C_T.partition_S(s_next), smem_thr_load_C_T.retile_D(ring_S_acc[bi][slot]));
-                    }
                 }
             }
             }
@@ -802,18 +800,25 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     }
 
     if constexpr (HasStateOut && StateFP32) {
-        // FP32 state: all threads sync, convert bf16->fp32, then STORE warp does TMA
+        // Store the FP32 register carry after the pipeline buffers are released.
         using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
         using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
 
         __syncthreads();  // all warps sync — pipeline smem now free
+        if (threadIdx.x < kComputeThreads) {
+            auto final_T = make_tensor(make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
+                typename Layouts::TransposedFP32StateSmemLayout{});
+            #pragma unroll
+            for (int m = 0; m < D / 16; ++m)
+                #pragma unroll
+                for (int bi = 0; bi < 2; ++bi) {
+                    auto block = local_tile(final_T, make_shape(_16{}, _16{}), make_coord(m, warp_id * 2 + bi));
+                    cute::copy(state_regs[m][bi], thr_mma.partition_C(block));
+                }
+        }
 
-        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, D, NumThreads>(
-            shared_storage.state_acc.begin(),
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            threadIdx.x);
         cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
-        __syncthreads();  // conversion complete
+        __syncthreads();  // register carry is published to the STORE warp
 
         if (warp_role == WarpRole::STORE && lane_predicate) {
             Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
@@ -834,6 +839,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         }
     }
 
+    if constexpr (HasStateOut) {
+        if (warp_role == WarpRole::STORE && lane_predicate) tma_store_wait<0>();
+    }
     __syncthreads();
 #endif
 }

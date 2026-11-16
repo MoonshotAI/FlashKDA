@@ -47,9 +47,9 @@ __device__ __forceinline__ float tanh_approx_f32(float x) {
     return result;
 }
 
-__device__ __forceinline__ float sigmoid_tanh_approx_f32(float x) {
-    float th = tanh_approx_f32(x * 0.5f);
-    return th * 0.5f + 0.5f;
+__device__ __forceinline__ float sigmoid_approx_f32(float x) {
+    // Avoid cancellation in 0.5 * tanh(x / 2) + 0.5 for small gates.
+    return 1.0f / (1.0f + ex2_approx_ftz_f32(-x * 1.4426950408889634f));
 }
 
 __device__ __forceinline__ float bf16_to_f32(cutlass::bfloat16_t x) {
