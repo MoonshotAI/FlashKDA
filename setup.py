@@ -3,8 +3,10 @@ import subprocess
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 
+from build_utils import update_cutlass_submodule
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
-subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+update_cutlass_submodule(this_dir)
 
 
 def is_flag_set(flag: str) -> bool:
