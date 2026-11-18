@@ -1,5 +1,14 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+
+_major, _minor = torch.cuda.get_device_capability()
+if _major == 8:
+    from flash_kda_C_sm80 import fwd as _fwd_raw, get_workspace_size
+elif _major >= 9:
+    from flash_kda_C_sm90 import fwd as _fwd_raw, get_workspace_size
+else:
+    raise RuntimeError(
+        f"FlashKDA requires SM80 (Ampere) or newer; got compute capability {_major}.{_minor}"
+    )
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
