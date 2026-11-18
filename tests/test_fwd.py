@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 import flash_kda
 import math
+import os
+from unittest.mock import patch
 
 from torch_ref import torch_ref
 
@@ -69,7 +71,10 @@ def make_test_cases(H, D, T_shape, dtype, device):
 
 
 def run_fla_gold_reference(q, k, v, g, beta, h0, A_log, dt_bias, scale, lower_bound, cu_seqlens=None):
-    """Run fused_recurrent_kda in fp64 as gold reference, and chunk_kda in bf16.
+    """Run fused_recurrent_kda in fp64 and FLA's Triton chunk_kda in bf16.
+
+    FLA_FLASH_KDA is disabled for chunk_kda so this tests the independent
+    upstream implementation rather than dispatching back to flash_kda.
     beta: [B, T, H] bf16 logits (pre-sigmoid).
     """
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
@@ -97,31 +102,32 @@ def run_fla_gold_reference(q, k, v, g, beta, h0, A_log, dt_bias, scale, lower_bo
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=False,
         lower_bound=None,
-        transpose_state_layout=True,
+        state_v_first=True,
         **fla_kwargs,
     )
     tri = tri.to(torch.float32)
     tri_ht = tri_ht.to(torch.float32)
 
-    # upstream hasn't implemented use_beta_sigmoid_in_kernel; pass post-sigmoid beta explicitly.
-    beta_activated = torch.sigmoid(beta.clone().float()).to(torch.bfloat16)
-    chunk_o, chunk_ht = chunk_kda(
-        q=q.clone().to(torch.bfloat16),
-        k=k.clone().to(torch.bfloat16),
-        v=v.clone(),
-        g=g.clone(),
-        beta=beta_activated,
-        scale=scale,
-        initial_state=h0.clone(),
-        output_final_state=True,
-        use_gate_in_kernel=True,
-        use_qk_l2norm_in_kernel=True,
-        A_log=A_log.clone(),
-        dt_bias=dt_bias.clone(),
-        lower_bound=lower_bound,
-        transpose_state_layout=True,
-        **fla_kwargs,
-    )
+    with patch.dict(os.environ, {"FLA_FLASH_KDA": "0"}):
+        chunk_o, chunk_ht = chunk_kda(
+            q=q.clone().to(torch.bfloat16),
+            k=k.clone().to(torch.bfloat16),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            scale=scale,
+            initial_state=h0.clone(),
+            output_final_state=True,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=True,
+            A_log=A_log.clone(),
+            dt_bias=dt_bias.clone(),
+            lower_bound=lower_bound,
+            state_v_first=True,
+            **fla_kwargs,
+        )
 
     return tri, tri_ht, chunk_o, chunk_ht
 
@@ -359,7 +365,8 @@ def test_fwd_vs_fla():
     for r in results:
         assert_close(f"{r['name']} o", r["tri"], r["out"], 0.005)
         assert_close(f"{r['name']} ht", r["tri_ht"], r["final_state"], 0.005, warning=True)
-        assert_close(f"{r['name']} chunk_kda ht", r["tri_ht"], r["chunk_ht"], 0.005, warning=True)
+        assert_close(f"{r['name']} chunk_kda o", r["chunk_o"], r["out"], 0.006)
+        assert_close(f"{r['name']} chunk_kda ht", r["chunk_ht"], r["final_state"], 0.006)
     print("Assert results: Success")
 
 
@@ -420,7 +427,8 @@ def test_fwd_varlen_vs_fla():
     for r in results:
         assert_close(f"{r['name']} o", r["tri"], r["out"], 0.006)
         assert_close(f"{r['name']} ht", r["tri_ht"], r["final_state"], 0.006, warning=True)
-        assert_close(f"{r['name']} chunk_kda ht", r["tri_ht"], r["chunk_ht"], 0.005, warning=True)
+        assert_close(f"{r['name']} chunk_kda o", r["chunk_o"], r["out"], 0.006)
+        assert_close(f"{r['name']} chunk_kda ht", r["chunk_ht"], r["final_state"], 0.006)
     print("Assert results: Success")
 
 
