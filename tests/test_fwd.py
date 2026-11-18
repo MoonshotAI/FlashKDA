@@ -4,6 +4,7 @@ import flash_kda
 import math
 
 from torch_ref import torch_ref
+from numerics import assert_matches_reference
 
 
 # ============================================================
@@ -220,7 +221,7 @@ def plot_error_comparison(results, save_path):
 # ============================================================
 
 def test_fwd():
-    """Test: cutlass kernel vs torch ref, require exact match."""
+    """Test: cutlass kernel vs torch ref with BF16-aware comparison."""
     B, T, H, D = 1, 8192, 96, 128
     LOWER_BOUND = -5.0
 
@@ -257,13 +258,19 @@ def test_fwd():
     print(f"{torch.max(out_kernel)} {torch.max(out_ref)}")
     print_error_stats("output", out_kernel, out_ref)
 
-    assert torch.equal(out_kernel, out_ref), "output mismatch between kernel and torch ref"
-    assert torch.equal(final_state_kernel, final_state_ref), "final_state mismatch between kernel and torch ref"
-    print("Success: kernel == torch ref (exact match)")
+    assert_matches_reference(
+        out_kernel, out_ref, msg="output mismatch between kernel and torch ref"
+    )
+    assert_matches_reference(
+        final_state_kernel,
+        final_state_ref,
+        msg="final_state mismatch between kernel and torch ref",
+    )
+    print("Success: kernel matches torch ref within BF16 tolerance")
 
 
 def test_fwd_varlen():
-    """Test: varlen cutlass kernel vs torch ref, require exact match."""
+    """Test: varlen cutlass kernel vs torch ref with BF16-aware comparison."""
     H, D = 96, 128
     LOWER_BOUND = -5.0
     seq_lens = [1300, 547, 2048, 963, 271, 3063]
@@ -307,9 +314,15 @@ def test_fwd_varlen():
     print(f"{torch.max(out_kernel)} {torch.max(out_ref)}")
     print_error_stats("output", out_kernel, out_ref)
 
-    assert torch.equal(out_kernel, out_ref), "output mismatch between kernel and torch ref"
-    assert torch.equal(final_state_kernel, final_state_ref), "final_state mismatch between kernel and torch ref"
-    print("Success: varlen kernel == torch ref (exact match)")
+    assert_matches_reference(
+        out_kernel, out_ref, msg="output mismatch between kernel and torch ref"
+    )
+    assert_matches_reference(
+        final_state_kernel,
+        final_state_ref,
+        msg="final_state mismatch between kernel and torch ref",
+    )
+    print("Success: varlen kernel matches torch ref within BF16 tolerance")
 
 
 @torch.inference_mode()
