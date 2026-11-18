@@ -150,6 +150,35 @@ def test_fwd_varlen(seq_lens, H, state_dtype, has_in, has_out):
             f"final_state mismatch: seqs={seq_lens} H={H} dtype={state_dtype} in={has_in} out={has_out}"
 
 
+def test_fwd_varlen_all_tail_lengths():
+    """Exercise every partial 16-row output tile at adjacent sequence boundaries."""
+    seq_lens = list(range(1, 16))
+    T_total = sum(seq_lens)
+    H = 4
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), dim=0).tolist()),
+        dtype=torch.long, device="cuda",
+    )
+
+    q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(T_total, H)
+    out_kernel = torch.full_like(q, float("nan"))
+    flash_kda.fwd(
+        q, k, v, g, beta, scale, out_kernel,
+        A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+        cu_seqlens=cu_seqlens,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = torch.empty_like(q)
+    torch_ref(
+        q, k, v, g, beta, scale, out_ref,
+        A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert torch.equal(out_kernel, out_ref)
+
+
 # ---------------------------------------------------------------------------
 # Batched tests (B > 1, equal-length sequences)
 # ---------------------------------------------------------------------------
