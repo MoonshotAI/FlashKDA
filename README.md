@@ -108,6 +108,39 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
 
+### Standalone inference
+
+After installing FlashKDA on a supported CUDA device, call the forward kernel
+directly without FLA. It writes into the supplied output tensor and allocates
+its workspace internally. This API does not provide a backward pass; for
+training with FLA, use its Triton backend.
+
+```python
+import flash_kda
+import torch
+from torch.nn.functional import normalize
+
+batch, tokens, heads, dim = 1, 64, 8, 128
+shape = (batch, tokens, heads, dim)
+device = "cuda"
+
+with torch.inference_mode():
+    q = normalize(torch.randn(shape, device=device), dim=-1).to(torch.bfloat16)
+    k = normalize(torch.randn(shape, device=device), dim=-1).to(torch.bfloat16)
+    v = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    g = torch.zeros_like(q)
+    beta = torch.zeros((batch, tokens, heads), device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(v)
+    A_log = torch.zeros(heads, device=device, dtype=torch.float32)
+    dt_bias = torch.zeros((heads, dim), device=device, dtype=torch.float32)
+
+    flash_kda.fwd(q, k, v, g, beta, dim ** -0.5, out,
+                  A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+
+torch.cuda.synchronize()
+print(out.shape)  # torch.Size([1, 64, 8, 128])
+```
+
 ## Development
 
 To set up IntelliSense (clangd) for the CUDA/C++ sources, run:
